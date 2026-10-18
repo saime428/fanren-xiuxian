@@ -1,0 +1,26 @@
+{
+  "enabled": false,
+  "mode": "shadow",
+  "network_enabled": false,
+  "accounts": [
+    "tg9100000001",
+    "tg9100000002",
+    "tg9100000003",
+    "tg9100000004",
+    "tg9100000005",
+    "tg9100000006"
+  ],
+  "credential_sources": {
+    "tg9100000001": "tg9100000001",
+    "tg9100000002": "tg9100000002",
+    "tg9100000003": "tg9100000003",
+    "tg9100000004": "tg9100000004",
+    "tg9100000005": "tg9100000005",
+    "tg9100000006": "tg9100000007"
+  },
+  "allowed_bot_patterns": [
+    "hantianzun\\d+_bot"
+  ],
+  "api_base_url": "https://asc.aiopenai.app",
+  "note": "Fail-closed protocol/replay only. Live start/input/claim remains disabled until captured response fixtures define and verify every mechanic reducer."
+}

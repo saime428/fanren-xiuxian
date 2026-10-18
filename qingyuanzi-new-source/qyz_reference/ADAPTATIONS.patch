@@ -1,0 +1,729 @@
+--- a/world_boss_browser.py
++++ b/world_boss_browser.py
+@@ -19,11 +19,12 @@
+ import signal
+ import socket
+ import subprocess
++import sys
+ import time
+ import urllib.request
+ import uuid
+ 
+-from world_boss_turnstile import WorldBossTurnstileBroker, TurnstileRequestError, MAX_TOKEN_LENGTH
++from .world_boss_turnstile import WorldBossTurnstileBroker, TurnstileRequestError, MAX_TOKEN_LENGTH
+ 
+ 
+ ORIGIN = "https://asc.aiopenai.app"
+@@ -47,7 +48,12 @@
+         candidate = shutil.which(name)
+         if candidate:
+             return candidate
+-    candidates = [Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")]
++    candidates = [
++        Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
++        Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
++        Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
++        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
++    ]
+     candidates += sorted((Path.home() / ".cache/ms-playwright").glob("chromium-*/*/chrome"), reverse=True)
+     for candidate in candidates:
+         if candidate.is_file():
+@@ -91,7 +97,7 @@
+             startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+             startup.wShowWindow = 0
+             args.append("--window-position=-32000,-32000")
+-        else:
++        elif sys.platform != "darwin":
+             # The VPS has a software display and no GPU. Match the verified
+             # native-browser launch without starting a GPU process.
+             args.append("--disable-gpu")
+@@ -296,7 +302,9 @@
+         self.last_attempt = {key: value for key, value in self.last_attempt.items() if key in live}
+         rows = [row for row in rows if self.attempts.get(row["request_id"], 0) < self.max_attempts
+                 and self.clock() - self.last_attempt.get(row["request_id"], -1000) >= 5]
+-        rows.sort(key=lambda row: (self.attempts.get(row["request_id"], 0), str(row.get("created_at", ""))))
++        order = getattr(self, "request_order", None)
++        rows.sort(key=lambda row: (self.attempts.get(row["request_id"], 0),
++                  order(row) if callable(order) else (str(row.get("created_at", "")),)))
+         if not rows:
+             if self.clock() - self.last_work >= 20:
+                 self.browser.close()
+--- a/world_boss_features.py
++++ b/world_boss_features.py
+@@ -24,9 +24,9 @@
+ 
+ from telethon import events
+ 
+-from automation_settings import world_boss_identities_for_account
+-from log_utils import is_game_bot_sender, resolve_actor_target_chats
+-from miniapp_beast import (
++from .compat import world_boss_identities_for_account
++from .compat import is_game_bot_sender, resolve_actor_target_chats
++from .compat import (
+     MiniAppBeastError,
+     MiniAppCircuitOpenError,
+     _post_json,
+@@ -34,7 +34,7 @@
+     miniapp_origin,
+     request_webview_init_data,
+ )
+-from world_boss_turnstile import (
++from .world_boss_turnstile import (
+     WorldBossTurnstileBroker,
+     default_world_boss_turnstile_broker,
+ )
+@@ -93,6 +93,7 @@
+ # Mini App client's own pacing so the automation stays inside normal call rates.
+ WORLD_BOSS_WINDOW_POLL_SECONDS = 0.36
+ WORLD_BOSS_WINDOW_DRAIN_SECONDS = 0.05
++WORLD_BOSS_WINDOW_TIMEOUT_SECONDS = 1
+ WORLD_BOSS_WINDOW_STALL_SECONDS = 20.0
+ WORLD_BOSS_WINDOW_LIMIT = 64
+ WORLD_BOSS_WINDOW_ERROR_BUDGET = 25
+@@ -100,6 +101,9 @@
+ # The server only credits a perfect hit while the reported hold sits in this range.
+ WORLD_BOSS_HOLD_MIN_MS = 520
+ WORLD_BOSS_HOLD_MAX_MS = 1250
++# A begin RTT is only an estimate of later request/return transit. Leave room
++# for that asymmetry when rescuing a slow charge instead of aiming at 520 ms.
++WORLD_BOSS_HOLD_RESCUE_MARGIN_MS = 120
+ # The server returns the measured ticket-to-hit hold on accepted strikes.  The
+ # difference from our local press-to-release duration is mostly the relative
+ # one-way latency of /charge-start and /hit.  Learn that skew during a battle,
+@@ -108,6 +112,7 @@
+ WORLD_BOSS_HOLD_SKEW_SAMPLE_MAX_MS = 700
+ WORLD_BOSS_HOLD_SKEW_HISTORY_SIZE = 5
+ WORLD_BOSS_HOLD_SKEW_WEIGHT = 0.35
++WORLD_BOSS_HOLD_FEEDBACK_MIN_RTT_LIMIT_MS = 400
+ WORLD_BOSS_HOLD_PLAN_MIN_MS = WORLD_BOSS_HOLD_MIN_MS + 40
+ WORLD_BOSS_HOLD_PLAN_MAX_MS = WORLD_BOSS_HOLD_MAX_MS - 40
+ # The charge request's latency already counts towards the hold, because the press
+@@ -770,19 +775,31 @@
+             await self.sleep(remaining)
+             return not self._boss_stop_requested()
+ 
+-        sleep_task = asyncio.create_task(self.sleep(remaining))
++        # Register an absolute event-loop deadline before yielding. Creating a
++        # child ``sleep(remaining)`` after a scheduler stall repeats the stale
++        # delay and can push a charge beyond its server window.
++        loop = asyncio.get_running_loop()
++        sleep_waiter = loop.create_future()
++
++        def wake() -> None:
++            if not sleep_waiter.done():
++                sleep_waiter.set_result(None)
++
++        deadline = loop.time() + float(target) - self.monotonic()
++        timer = loop.call_at(deadline, wake)
+         stop_task = asyncio.create_task(self._wait_for_boss_stop())
+         try:
+             done, _ = await asyncio.wait(
+-                (sleep_task, stop_task),
++                (sleep_waiter, stop_task),
+                 return_when=asyncio.FIRST_COMPLETED,
+             )
+-            return stop_task not in done
++            return stop_task not in done and not self._boss_stop_requested()
+         finally:
+-            for task in (sleep_task, stop_task):
++            timer.cancel()
++            for task in (sleep_waiter, stop_task):
+                 if not task.done():
+                     task.cancel()
+-            await asyncio.gather(sleep_task, stop_task, return_exceptions=True)
++            await asyncio.gather(sleep_waiter, stop_task, return_exceptions=True)
+ 
+     def _history(self) -> list[dict[str, Any]]:
+         state = getattr(self.actor, "state", None)
+@@ -1572,7 +1589,7 @@
+     ) -> None:
+         """Page through /window until the server reports ``done``.
+ 
+-        Mirrors the browser: poll roughly every 360ms, treat
++        Mirrors the browser: start requests at least 360ms apart, treat
+         ``boss_window_not_ready`` as "keep waiting", and stop once the server has
+         no more windows. Each reveal records how much lead time it arrived with,
+         which is the number needed to judge whether a full hold still fits.
+@@ -1580,13 +1597,17 @@
+         after_window_id = ""
+         error_budget = WORLD_BOSS_WINDOW_ERROR_BUDGET
+         last_reveal_at = self.monotonic()
++        last_stall_notice_at = last_reveal_at
+         deadline = battle_start + WORLD_BOSS_MAX_BATTLE_SECONDS
+         revealed_count = 0
++        revealed_ids: set[str] = set()
++        exit_reason = "window_count_reached"
+         try:
+             # Bound on windows actually revealed: error entries share reveal_log but
+             # must never consume the budget of windows still to come.
+             while revealed_count < min(expected_count, WORLD_BOSS_WINDOW_LIMIT):
+                 if self._boss_stop_requested():
++                    exit_reason = "boss_stopped"
+                     reveal_log.append(
+                         {
+                             "sequence": revealed_count + 1,
+@@ -1597,11 +1618,20 @@
+                     break
+                 now = self.monotonic()
+                 if now >= deadline:
++                    exit_reason = "battle_deadline"
+                     break
+-                if now - last_reveal_at >= WORLD_BOSS_WINDOW_STALL_SECONDS:
+-                    # No new window for several expected intervals: the round is
+-                    # over or the server stopped revealing. Do not hold the worker.
+-                    break
++                if now - max(last_reveal_at, last_stall_notice_at) >= WORLD_BOSS_WINDOW_STALL_SECONDS:
++                    # A local scheduling or network stall is not evidence that
++                    # the server ended the battle. Preserve the cursor and keep
++                    # polling until an explicit end, the bounded error budget,
++                    # or the battle deadline.
++                    reveal_log.append({
++                        "sequence": revealed_count + 1,
++                        "status": "stalled",
++                        "elapsed_ms": max(0, int(round((now - battle_start) * 1000))),
++                        "since_reveal_ms": max(0, int(round((now - last_reveal_at) * 1000))),
++                    })
++                    last_stall_notice_at = now
+                 trace: dict[str, Any] = {}
+                 requested_at = self.monotonic()
+                 try:
+@@ -1615,7 +1645,7 @@
+                             "afterWindowId": after_window_id,
+                         },
+                         retries=0,
+-                        timeout=min(self.timeout, 5),
++                        timeout=min(self.timeout, WORLD_BOSS_WINDOW_TIMEOUT_SECONDS),
+                         trace=trace,
+                         time_critical=False,
+                     )
+@@ -1623,6 +1653,7 @@
+                     raise
+                 except MiniAppBeastError as exc:
+                     if exc.code == "boss_event_closed":
++                        exit_reason = "boss_event_closed"
+                         self._mark_boss_defeated("boss_event_closed")
+                         break
+                     if exc.code not in WORLD_BOSS_WINDOW_WAIT_ERRORS:
+@@ -1639,18 +1670,21 @@
+                             }
+                         )
+                         if error_budget <= 0:
+-                            break
+-                    await self.sleep(WORLD_BOSS_WINDOW_POLL_SECONDS)
++                            exit_reason = "error_budget_exhausted"
++                            raise MiniAppBeastError("boss_window_fetch_failed") from exc
++                    await self._wait_for_window_poll(requested_at)
+                     continue
+-                except Exception:
++                except Exception as exc:
+                     error_budget -= 1
+                     if error_budget <= 0:
+-                        break
+-                    await self.sleep(WORLD_BOSS_WINDOW_POLL_SECONDS)
++                        exit_reason = "error_budget_exhausted"
++                        raise MiniAppBeastError("boss_window_fetch_failed") from exc
++                    await self._wait_for_window_poll(requested_at)
+                     continue
+ 
+                 received_at = self.monotonic()
+                 if self._boss_stop_requested():
++                    exit_reason = "boss_stopped"
+                     reveal_log.append(
+                         {
+                             "sequence": revealed_count + 1,
+@@ -1666,10 +1700,11 @@
+                 except (TypeError, ValueError):
+                     reported_count = 0
+                 if reported_count > 0:
+-                    expected_count = min(
+-                        max(expected_count, reported_count), WORLD_BOSS_WINDOW_LIMIT
+-                    )
++                    expected_count = min(max(revealed_count, reported_count), WORLD_BOSS_WINDOW_LIMIT)
++                if window is not None and window["id"] in revealed_ids:
++                    window = None
+                 if window is not None:
++                    revealed_ids.add(window["id"])
+                     after_window_id = window["id"]
+                     last_reveal_at = received_at
+                     revealed_count += 1
+@@ -1684,6 +1719,7 @@
+                             "center_ms": window["centerMs"],
+                             "hit_ms": window["hitMs"],
+                             "perfect_ms": window["perfectMs"],
++                            "requested_elapsed_ms": int(round((requested_at - battle_start) * 1000)),
+                             "received_elapsed_ms": received_elapsed_ms,
+                             # Positive means the window arrived before its center,
+                             # i.e. how much room is left to charge and strike.
+@@ -1692,15 +1728,71 @@
+                         }
+                     )
+                     await queue.put(window)
+-                if bool(data.get("done")):
++                if bool(data.get("done")) and revealed_count >= expected_count:
++                    exit_reason = "server_done"
+                     break
+-                await self.sleep(
+-                    WORLD_BOSS_WINDOW_DRAIN_SECONDS
+-                    if window is not None
+-                    else WORLD_BOSS_WINDOW_POLL_SECONDS
+-                )
++                await self._wait_for_window_poll(requested_at)
++        except BaseException as exc:
++            if exit_reason == "window_count_reached":
++                exit_reason = "cancelled" if isinstance(exc, asyncio.CancelledError) else "request_failed"
++            raise
+         finally:
++            reveal_log.append({
++                "status": "finished",
++                "reason": exit_reason,
++                "revealed_count": revealed_count,
++                "expected_count": expected_count,
++                "elapsed_ms": max(0, int(round((self.monotonic() - battle_start) * 1000))),
++            })
+             await queue.put(None)
++
++    async def _wait_for_window_poll(self, requested_at: float) -> None:
++        # The official client measures its 360 ms interval from request start.
++        # Adding another 360 ms after a 300 ms reply nearly halves reveal rate.
++        # There is still just one in-flight read and no catch-up burst.
++        await self.sleep(max(
++            0.0, requested_at + WORLD_BOSS_WINDOW_POLL_SECONDS - self.monotonic()
++        ))
++
++    def _notify_timing_update(self) -> None:
++        """Wake only schedules that have not submitted their action yet."""
++        signal = getattr(self, "_timing_updated", None)
++        if signal is not None:
++            signal.set()
++        self._timing_updated = asyncio.Event()
++
++    async def _wait_for_timing_target(self, plan: Any) -> bool:
++        """Recompute a pending deadline when an arrived receipt changes timing.
++
++        This uses receipt events, not faster API polling or a busy timer. A
++        charge already sent keeps its real start time; only its future release
++        can be replanned, with the same ticket and hold limits.
++        """
++        while True:
++            signal = getattr(self, "_timing_updated", None)
++            if signal is None:
++                signal = self._timing_updated = asyncio.Event()
++            target = plan()
++            sleeper = asyncio.create_task(self._sleep_until(target))
++            changed = asyncio.create_task(signal.wait())
++            completed, okay = False, False
++            try:
++                done, _ = await asyncio.wait((sleeper, changed), return_when=asyncio.FIRST_COMPLETED)
++                if sleeper in done:
++                    completed, okay = True, sleeper.result()
++            finally:
++                for task in (sleeper, changed):
++                    if not task.done():
++                        task.cancel()
++                await asyncio.gather(sleeper, changed, return_exceptions=True)
++            if completed and not okay:
++                return False
++            if completed and not signal.is_set():
++                return True
++
++    def _window_progress(self, window: dict[str, Any], window_index: int,
++                         battle_start: float, phase: str, **fields: Any) -> None:
++        """Optional account-owned observation hook; never a server verdict."""
+ 
+     def _reset_drift(self) -> None:
+         """Forget the previous battle's arrival skew.
+@@ -1747,6 +1839,25 @@
+                 if value is not None:
+                     return value
+         return None
++
++    @classmethod
++    def _hold_feedback_quality(
++        cls, charge_request: dict[str, Any], hit_request: dict[str, Any], request_lead_ms: int,
++    ) -> dict[str, Any]:
++        """Only learn a persistent hold bias from comparable one-shot requests."""
++        limit = max(float(WORLD_BOSS_HOLD_FEEDBACK_MIN_RTT_LIMIT_MS), 4 * request_lead_ms)
++        quality: dict[str, Any] = {"eligible": False, "request_limit_ms": int(round(limit))}
++        for name, trace in (("charge", charge_request), ("hit", hit_request)):
++            duration = cls._finite_ms(trace.get("total_duration_ms"))
++            quality[name + "_request_ms"] = cls._rounded_ms(duration)
++            attempts = trace.get("attempts") or []
++            if duration is None or duration < 0 or not attempts:
++                return {**quality, "reason": "request_timing_missing"}
++            if len(attempts) != 1:
++                return {**quality, "reason": name + "_request_retried"}
++            if duration > limit:
++                return {**quality, "reason": "slow_" + name + "_request"}
++        return {**quality, "eligible": True, "reason": "comparable_requests"}
+ 
+     def _record_hold_skew(self, server_hold_ms: Any, local_hold_ms: Any) -> float | None:
+         """Update a robust EWMA of ``server hold - local hold``.
+@@ -1770,6 +1881,7 @@
+             -float(WORLD_BOSS_HOLD_SKEW_SAMPLE_MAX_MS),
+             min(float(WORLD_BOSS_HOLD_SKEW_SAMPLE_MAX_MS), sample),
+         )
++        previous = self._hold_skew_ms
+         self._hold_skew_samples.append(sample)
+         del self._hold_skew_samples[:-WORLD_BOSS_HOLD_SKEW_HISTORY_SIZE]
+         robust = float(statistics.median(self._hold_skew_samples))
+@@ -1784,6 +1896,8 @@
+             -float(WORLD_BOSS_HOLD_SKEW_SAMPLE_MAX_MS),
+             min(float(WORLD_BOSS_HOLD_SKEW_SAMPLE_MAX_MS), self._hold_skew_ms),
+         )
++        if self._hold_skew_ms != previous:
++            self._notify_timing_update()
+         return sample
+ 
+     def _planned_hold_ms(self) -> int:
+@@ -2114,7 +2228,10 @@
+             )
+         )
+         if not contextual:
++            before = self._drift_ms
+             self._record_drift_legacy(server_delta_ms)
++            if self._drift_ms != before:
++                self._notify_timing_update()
+             return None
+ 
+         inference = self._infer_arrival_direction(
+@@ -2152,6 +2269,8 @@
+             inference["drift_after_ms"] = self._rounded_ms(self._drift_ms)
+             inference["update_applied"] = self._drift_samples > 0
+             inference["update_mode"] = "legacy_zero_rtt"
++            if self._drift_ms != before:
++                self._notify_timing_update()
+             return inference
+ 
+         # Drive the feedback from the inferred sign.  A request that arrived
+@@ -2197,6 +2316,8 @@
+             min(float(WORLD_BOSS_DRIFT_MAX_MS), self._drift_ms),
+         )
+         self._drift_samples += 1
++        if self._drift_ms != before:
++            self._notify_timing_update()
+         inference.update(
+             {
+                 "update_applied": True,
+@@ -2313,7 +2434,6 @@
+             0, int(window["centerMs"]) + offset_ms - request_lead_ms - drift_ms
+         )
+         initial_target_ms = target_ms
+-        target = battle_start + target_ms / 1000.0
+ 
+         # 2026-08-26 protocol: /hit is rejected without a chargeTicket, and the
+         # ticket is issued by /charge-start when the hold begins. Start charging one
+@@ -2322,28 +2442,39 @@
+         charge_error = ""
+         charge_trace: dict[str, Any] = {}
+         charge_started_elapsed_ms = -1
++        charge_received_elapsed_ms = -1
+         planned_hold_ms = self._planned_hold_ms() if charge_required else 0
+         hold_skew_estimate_ms = int(round(self._hold_skew_ms))
+         hold_ms = planned_hold_ms
++        timing_plans: list[dict[str, Any]] = []
++
++        def observe_plan(phase: str, strike_ms: int, guard: dict[str, Any] | None = None) -> None:
++            plan = {
++                "phase": phase, "charge_target_ms": target_ms - planned_hold_ms,
++                "release_target_ms": strike_ms, "planned_hold_ms": planned_hold_ms,
++                "request_lead_ms": request_lead_ms, "drift_lead_ms": drift_ms,
++                "hold_guard": dict(guard or {}),
++            }
++            if timing_plans and all(timing_plans[-1].get(k) == v for k, v in plan.items()):
++                return
++            plan["observed_elapsed_ms"] = int(round((self.monotonic() - battle_start) * 1000))
++            timing_plans.append(plan)
++            del timing_plans[:-32]
++            self._window_progress(window, window_index, battle_start, phase,
++                                  **{k: v for k, v in plan.items() if k != "phase"})
++
+         if charge_required:
+-            charge_at = target - planned_hold_ms / 1000.0
+-            if not await self._sleep_until(charge_at):
++            def charge_target() -> float:
++                nonlocal drift_ms, target_ms, planned_hold_ms, hold_skew_estimate_ms
++                drift_ms = self._drift_lead_ms()
++                planned_hold_ms = self._planned_hold_ms()
++                hold_skew_estimate_ms = int(round(self._hold_skew_ms))
++                target_ms = max(0, int(window["centerMs"]) + offset_ms - request_lead_ms - drift_ms)
++                observe_plan("waiting_charge", target_ms)
++                return battle_start + (target_ms - planned_hold_ms) / 1000.0
++
++            if not await self._wait_for_timing_target(charge_target):
+                 return self._skipped_hit_result(window, window_index)
+-            # A previous window may have completed while this one was waiting
+-            # for its charge slot.  Refresh the signed lead immediately before
+-            # minting the ticket so feedback can still move a not-yet-started
+-            # charge later (or mark an already-late one accurately).
+-            refreshed_drift_ms = self._drift_lead_ms()
+-            if refreshed_drift_ms != drift_ms:
+-                drift_ms = refreshed_drift_ms
+-                target_ms = max(
+-                    0,
+-                    int(window["centerMs"]) + offset_ms - request_lead_ms - drift_ms,
+-                )
+-                target = battle_start + target_ms / 1000.0
+-                refreshed_charge_at = target - planned_hold_ms / 1000.0
+-                if not await self._sleep_until(refreshed_charge_at):
+-                    return self._skipped_hit_result(window, window_index)
+             charge_started_at = self.monotonic()
+             charge_started_elapsed_ms = max(
+                 0, int(round((charge_started_at - battle_start) * 1000))
+@@ -2363,6 +2494,9 @@
+                     trace=charge_trace,
+                     time_critical=False,
+                 )
++                charge_received_elapsed_ms = max(
++                    0, int(round((self.monotonic() - battle_start) * 1000))
++                )
+                 charge_ticket = str(charge_payload.get("chargeTicket") or "").strip()
+                 charge_boss_hp = self._boss_hp_from_response(charge_payload)
+                 if charge_boss_hp is not None and charge_boss_hp <= 0:
+@@ -2379,35 +2513,46 @@
+         if self._boss_stop_requested():
+             return self._skipped_hit_result(window, window_index)
+ 
+-        # The charge request itself can take long enough for another strike's
+-        # response to update the controller.  Re-read once before releasing so
+-        # a delayed target is still reachable when the new estimate moves it
+-        # later.  If the new target is already in the past, releasing now is the
+-        # only honest option and the local/server diagnostics expose the miss.
+-        refreshed_drift_ms = self._drift_lead_ms()
+-        if refreshed_drift_ms != drift_ms:
+-            drift_ms = refreshed_drift_ms
+-            target_ms = max(
+-                0,
+-                int(window["centerMs"]) + offset_ms - request_lead_ms - drift_ms,
+-            )
+-            target = battle_start + target_ms / 1000.0
+-
+         strike_ms = target_ms
+-        if charge_required and charge_ticket and charge_started_elapsed_ms >= 0:
+-            # A late reveal cannot reach the minimum hold by the ideal strike time.
+-            # Delaying the strike buys hold, but only helps while the later moment
+-            # still sits inside the perfect tolerance; past that, accuracy wins.
+-            min_hold_strike_ms = charge_started_elapsed_ms + WORLD_BOSS_HOLD_MIN_MS
+-            if min_hold_strike_ms > strike_ms:
+-                perfect_deadline_ms = (
+-                    int(window["centerMs"]) + int(window["perfectMs"]) - 40
+-                )
+-                if min_hold_strike_ms <= perfect_deadline_ms:
+-                    strike_ms = min_hold_strike_ms
+-        target = battle_start + strike_ms / 1000.0
+-
+-        if not await self._sleep_until(target):
++        hold_guard: dict[str, Any] = {}
++
++        def release_target() -> float:
++            nonlocal drift_ms, target_ms, strike_ms, hold_guard
++            # Previous-window feedback may arrive during the hold itself. It
++            # wakes this schedule, rather than waiting for the old release time.
++            drift_ms = self._drift_lead_ms()
++            target_ms = max(0, int(window["centerMs"]) + offset_ms - request_lead_ms - drift_ms)
++            strike_ms, hold_guard = target_ms, {}
++            if charge_required and charge_ticket and charge_started_elapsed_ms >= 0:
++                # Estimate ticket age using only the charge reply and arrived
++                # timing feedback. Re-check the same arrival and age bounds
++                # whenever the release target moves. Never use a future verdict.
++                arrival_lead_ms = max(0, request_lead_ms + drift_ms)
++                transit_credit_ms = max(0, request_lead_ms) + arrival_lead_ms
++                min_hold_strike_ms = max(
++                    charge_started_elapsed_ms + WORLD_BOSS_HOLD_MIN_MS,
++                    charge_received_elapsed_ms + WORLD_BOSS_HOLD_MIN_MS
++                    + WORLD_BOSS_HOLD_RESCUE_MARGIN_MS - transit_credit_ms,
++                )
++                perfect_deadline_ms = min(
++                    int(window["centerMs"]) + int(window["perfectMs"]) - arrival_lead_ms - 40,
++                    charge_started_elapsed_ms + WORLD_BOSS_HOLD_MAX_MS - arrival_lead_ms - 40,
++                )
++                candidate_ms = max(strike_ms, min_hold_strike_ms, charge_received_elapsed_ms)
++                feasible = candidate_ms <= perfect_deadline_ms
++                strike_ms = max(strike_ms, min(candidate_ms, perfect_deadline_ms))
++                hold_guard = {
++                    "feasible": feasible,
++                    "transit_credit_ms": transit_credit_ms,
++                    "minimum_strike_ms": min_hold_strike_ms,
++                    "latest_strike_ms": perfect_deadline_ms,
++                    "delay_ms": strike_ms - target_ms,
++                    "margin_limited": not feasible and strike_ms > target_ms,
++                }
++            observe_plan("charging" if charge_ticket else "charge_unconfirmed", strike_ms, hold_guard)
++            return battle_start + strike_ms / 1000.0
++
++        if not await self._wait_for_timing_target(release_target):
+             return self._skipped_hit_result(window, window_index)
+         sent_elapsed_ms = max(0, int(round((self.monotonic() - battle_start) * 1000)))
+         if self._boss_stop_requested():
+@@ -2457,14 +2602,17 @@
+             "sent_elapsed_ms": sent_elapsed_ms,
+             "actual_elapsed_ms": elapsed_ms,
+             "signed_delta_ms": signed_delta_ms,
+-            "wake_lateness_ms": elapsed_ms - strike_ms,
++            "wake_lateness_ms": sent_elapsed_ms - strike_ms,
+             "hold_ms": hold_ms,
++            "hold_guard": hold_guard,
++            "timing_plans": timing_plans,
+             "local_matched": matched,
+             "local_perfect": perfect,
+         }
+         if charge_required:
+             diagnostic["charge"] = {
+                 "requested_elapsed_ms": charge_started_elapsed_ms,
++                "received_elapsed_ms": charge_received_elapsed_ms,
+                 "granted": bool(charge_ticket),
+                 "error": charge_error,
+                 "request": charge_trace,
+@@ -2531,9 +2679,16 @@
+             boss_hp = self._boss_hp_from_response(payload, hit)
+             if boss_hp is not None and boss_hp <= 0:
+                 self._mark_boss_defeated("boss_defeated", boss_hp)
+-            accepted_perfect = bool(hit.get("perfect")) if "perfect" in hit else perfect
++            accepted_perfect = hit.get("perfect") is True
+             server_hold_ms = self._server_hold_ms(hit)
+-            hold_skew_sample_ms = self._record_hold_skew(server_hold_ms, hold_ms)
++            hold_feedback = self._hold_feedback_quality(charge_trace, request_trace, request_lead_ms)
++            hold_skew_sample_ms = (
++                self._record_hold_skew(server_hold_ms, hold_ms) if hold_feedback["eligible"] else None
++            )
++            hold_feedback["update_applied"] = hold_skew_sample_ms is not None
++            if hold_feedback["eligible"] and hold_skew_sample_ms is None:
++                hold_feedback["reason"] = "unusable_hold_sample"
++            diagnostic["hold_feedback"] = hold_feedback
+             request_completed_elapsed_ms = max(
+                 0,
+                 int((self.monotonic() - battle_start) * 1000),
+@@ -2547,7 +2702,9 @@
+                 sent_elapsed_ms=sent_elapsed_ms,
+                 request_completed_elapsed_ms=request_completed_elapsed_ms,
+                 request_lead_ms=request_lead_ms,
+-                account_offset_ms=offset_ms,
++                # A deliberate hold rescue is not network drift. Otherwise
++                # its later arrival would pull every following strike earlier.
++                account_offset_ms=offset_ms + strike_ms - target_ms,
+             )
+             diagnostic.update(
+                 {
+@@ -2948,6 +3105,45 @@
+         # for static analyzers and unusual test doubles.
+         raise MiniAppBeastError("request_failed")
+ 
++    @classmethod
++    def _reconcile_finish_counts(cls, outcome: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
++        """Use valid settlement counts without changing the submitted proof."""
++        reported_hits = max(0, int(outcome.get("hit_count") or 0))
++        reported_perfects = max(0, int(outcome.get("perfect_count") or 0))
++        windows = max(0, int(outcome.get("window_count") or WORLD_BOSS_WINDOW_LIMIT))
++
++        def count(key: str, maximum: int) -> int | None:
++            raw = result.get(key)
++            value = cls._finite_ms(raw) if not isinstance(raw, bool) else None
++            if value is None or not value.is_integer() or not 0 <= value <= maximum:
++                return None
++            return int(value)
++
++        hits, hits_source = reported_hits, "realtime_responses"
++        for key in ("hits", "realtime_hit_count"):
++            value = count(key, windows)
++            if value is not None:
++                hits, hits_source = value, "finish." + key
++                break
++        perfects = count("perfects", hits)
++        perfects_source = "finish.perfects"
++        if perfects is None:
++            perfects = min(reported_perfects, hits)
++            perfects_source = (
++                "realtime_responses" if perfects == reported_perfects
++                else "bounded_realtime_responses"
++            )
++        outcome.update(hit_count=hits, perfect_count=perfects)
++        return {
++            "reported_hits": reported_hits,
++            "reported_perfects": reported_perfects,
++            "hits": hits,
++            "perfects": perfects,
++            "hits_source": hits_source,
++            "perfects_source": perfects_source,
++            "mismatch": (hits, perfects) != (reported_hits, reported_perfects),
++        }
++
+     async def _fight(
+         self,
+         entry: WorldBossEntry,
+@@ -3061,6 +3257,7 @@
+             except BaseException:
+                 for task in hit_tasks:
+                     task.cancel()
++                await asyncio.gather(*hit_tasks, return_exceptions=True)
+                 raise
+             finally:
+                 reveal_task.cancel()
+@@ -3097,16 +3294,24 @@
+             hit_results = await asyncio.gather(*tasks)
+ 
+         last_end_ms = max(item["centerMs"] + item["hitMs"] for item in windows)
+-        finish_at = battle_start + last_end_ms / 1000.0 + self.finish_grace_seconds
++        minimum_duration_ms = max(
++            0, int(self._finite_ms(challenge.get("minDurationMs")) or 0),
++        )
++        ordinary_finish_at = battle_start + last_end_ms / 1000.0 + self.finish_grace_seconds
++        minimum_finish_at = battle_start + minimum_duration_ms / 1000.0 + 0.05
++        finish_at = max(ordinary_finish_at, minimum_finish_at)
+         finish_wait = finish_at - self.monotonic()
+         if finish_wait > 0:
+             # A known defeat closes the room immediately.  Keep only a short
+             # drain for a response already in flight; otherwise retain the
+             # original browser-compatible wait through the last window.
+             if self._boss_stop_requested():
+-                finish_at = min(
+-                    finish_at,
+-                    self.monotonic() + WORLD_BOSS_DEFEAT_FINISH_GRACE_SECONDS,
++                finish_at = max(
++                    minimum_finish_at,
++                    min(
++                        ordinary_finish_at,
++                        self.monotonic() + WORLD_BOSS_DEFEAT_FINISH_GRACE_SECONDS,
++                    ),
+                 )
+             await self._sleep_until(finish_at)
+ 
+@@ -3150,6 +3355,7 @@
+             default=0,
+         )
+         duration_ms = max(
++            minimum_duration_ms,
+             last_end_ms + int(self.finish_grace_seconds * 1000),
+             last_action_ms,
+             elapsed_ms,
+@@ -3188,7 +3394,13 @@
+             trace=finish_trace,
+             time_critical=False,
+         )
+-        result = finished.get("result") if isinstance(finished.get("result"), dict) else {}
++        raw_result = finished.get("result")
++        result: dict[str, Any] = raw_result if isinstance(raw_result, dict) else {}
++        settlement = {"hit_count": successful_hits, "perfect_count": accepted_perfect_hits,
++                      "window_count": len(windows)}
++        settlement_counts = self._reconcile_finish_counts(settlement, result)
++        successful_hits = settlement["hit_count"]
++        accepted_perfect_hits = settlement["perfect_count"]
+         player = _diagnostic_value(player)
+         boss = payload.get("boss") if isinstance(payload.get("boss"), dict) else {}
+         challenge_profile = {
+@@ -3259,12 +3471,16 @@
+             "finish": {
+                 "request": finish_trace,
+                 "server_result": _diagnostic_value(result),
++                "counts": settlement_counts,
+             },
+         }
++        final_player_hp = result.get("player_hp")
++        if final_player_hp is None:
++            final_player_hp = player_hp
+         return {
+             "grade": str(result.get("grade") or ""),
+             "score": int(result.get("score") or 0),
+-            "player_hp": int(result.get("player_hp") if result.get("player_hp") is not None else player_hp),
++            "player_hp": int(final_player_hp),
+             "hit_count": successful_hits,
+             "perfect_count": accepted_perfect_hits,
+             "local_matched_count": local_matched_hits,

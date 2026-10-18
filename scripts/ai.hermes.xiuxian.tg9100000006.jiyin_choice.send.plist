@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>ai.hermes.xiuxian.tg9100000006.jiyin_choice.send</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>-lc</string><string>cd /Users/operator/.hermes/workspace/projects/xiuxian &amp;&amp; mkdir -p state/accounts/tg9100000006/jiyin_choice &amp;&amp; bash ./scripts/send_jiyin_choice_tg9100000006.sh &gt;&gt; state/accounts/tg9100000006/jiyin_choice/send.launchd.log 2&gt;&amp;1</string></array>
+<key>WorkingDirectory</key><string>/Users/operator/.hermes/workspace/projects/xiuxian</string>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><true/>
+<key>ThrottleInterval</key><integer>60</integer>
+<key>StandardErrorPath</key><string>/Users/operator/.hermes/workspace/projects/xiuxian/state/accounts/tg9100000006/jiyin_choice/send.launchd.log</string>
+</dict></plist>

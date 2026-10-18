@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.hermes.xiuxian.tg9100000001.shendubiguan.return_observer</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>cd /Users/operator/.hermes/workspace/projects/xiuxian &amp;&amp; mkdir -p state/accounts/tg9100000001/shendubiguan &amp;&amp; bash ./scripts/run_shendubiguan_return_observer_tg9100000001.sh &gt;&gt; state/accounts/tg9100000001/shendubiguan/observer.launchd.log 2&gt;&amp;1</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/operator/.hermes/workspace/projects/xiuxian</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/operator/.hermes/workspace/projects/xiuxian/state/accounts/tg9100000001/shendubiguan/observer.launchd.log</string>
+</dict>
+</plist>

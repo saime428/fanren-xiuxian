@@ -1,0 +1,5 @@
+name: xiuxian-duel-direct
+version: "0.1.0"
+description: "Direct /doufa command: existing five-account campaign, no LLM."
+author: "Boss / Hermes local"
+hooks: []

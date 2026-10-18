@@ -1,0 +1,145 @@
+{
+  "notify": {"target": "telegram:9100000001", "hermes_bin": "/Users/operator/.hermes/hermes-agent/venv/bin/hermes"},
+  "accounts": [
+    {
+      "id": "tg9100000001",
+      "username": "demo_player_01",
+      "session": "state/accounts/tg9100000001/session.session",
+      "bound_identity": {"player_id": 9200000001, "label": "示例绑定角色"},
+      "features": {
+        "shendubiguan": true,
+        "yuanyingchuqiao": true,
+        "shenji_budao": true,
+        "fumofabao_xuantianzhanlingjian": true,
+        "jiaohuan_gongfa": true,
+        "jiyin_choice": {"reply": ".献上魂魄"},
+        "xuangu_zuoda": true,
+        "shuangxiu_wenyang": {"partner": "tg9100000003"},
+        "treasure_hunt": true,
+        "tianxing_exploration": true,
+        "yuanshen": true,
+        "qingyuanzi": true,
+        "fishing": {"special_bait": true},
+        "star_observatory": true,
+        "tower": true,
+        "journey": true,
+        "fate_cards": {"canary": true},
+        "sect_daily": true,
+        "pavilion": {"routes": {"南宫婉·月影": "月殿寻痕"}},
+        "account_lifecycle": {"listener": true}
+      }
+    },
+    {
+      "id": "tg9100000002",
+      "username": "demo_player_02",
+      "features": {
+        "shendubiguan": true,
+        "yuanyingchuqiao": true,
+        "tanxunliefeng": true,
+        "xuexishanlin": true,
+        "zhaohuanmoying": true,
+        "fumofabao_qingzhufengyunjian_shenlei": {"interval_dispatch_seconds": 7200},
+        "jiaohuan_fabao": true,
+        "jiyin_choice": true,
+        "xuangu_zuoda": true,
+        "treasure_hunt": true,
+        "qingyuanzi": true,
+        "fishing": true,
+        "tower": true,
+        "journey": true,
+        "fate_cards": true,
+        "sect_daily": true,
+        "pavilion": true,
+        "account_lifecycle": true
+      }
+    },
+    {
+      "id": "tg9100000003",
+      "username": "demo_player_03",
+      "features": {
+        "shendubiguan": true,
+        "yuanyingchuqiao": true,
+        "tanxunliefeng": true,
+        "jiaohuan_fabao": true,
+        "jiyin_choice": true,
+        "xuangu_zuoda": true,
+        "treasure_hunt": true,
+        "qingyuanzi": true,
+        "fishing": true,
+        "tower": true,
+        "journey": true,
+        "fate_cards": true,
+        "sect_daily": true,
+        "pavilion": true,
+        "account_lifecycle": true
+      }
+    },
+    {
+      "id": "tg9100000004",
+      "username": "demo_player_04",
+      "features": {
+        "shendubiguan": true,
+        "yuanyingchuqiao": true,
+        "tanxunliefeng": true,
+        "jiaohuan_fabao": true,
+        "jiyin_choice": true,
+        "xuangu_zuoda": true,
+        "treasure_hunt": true,
+        "qingyuanzi": {"entry_discovery": true},
+        "fishing": true,
+        "star_observatory": true,
+        "tower": true,
+        "journey": true,
+        "fate_cards": true,
+        "sect_daily": true,
+        "pavilion": true,
+        "account_lifecycle": true
+      }
+    },
+    {
+      "id": "tg9100000005",
+      "username": "demo_player_05",
+      "features": {
+        "shendubiguan": true,
+        "yuanyingchuqiao": true,
+        "tanxunliefeng": true,
+        "jiaohuan_fabao": true,
+        "jiyin_choice": true,
+        "xuangu_zuoda": true,
+        "treasure_hunt": true,
+        "qingyuanzi": true,
+        "fishing": true,
+        "star_observatory": true,
+        "tower": true,
+        "journey": true,
+        "fate_cards": true,
+        "sect_daily": true,
+        "pavilion": true,
+        "account_lifecycle": true
+      }
+    },
+    {
+      "id": "tg9100000006",
+      "username": "demo_player_06",
+      "credential_source": "tg9100000007",
+      "features": {
+        "shendubiguan": true,
+        "tanxunliefeng": true,
+        "wendao": true,
+        "fumofabao_qingzhufengyunjian_shenlei": true,
+        "jiaohuan_fabao": true,
+        "jiyin_choice": true,
+        "xuangu_zuoda": true,
+        "treasure_hunt": true,
+        "qingyuanzi": true,
+        "fishing": true,
+        "tower": true,
+        "journey": true,
+        "fate_cards": true,
+        "sect_daily": true,
+        "pavilion": true,
+        "account_lifecycle": true
+      }
+    }
+  ]
+}

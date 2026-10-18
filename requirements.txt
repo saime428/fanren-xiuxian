@@ -1,0 +1,9 @@
+telethon>=1.36,<2
+python-socks>=2.4,<3
+python-dotenv>=1.0,<2
+requests>=2.31,<3
+httpx>=0.28,<0.29
+websockets>=13,<17
+websocket-client>=1.8,<2
+pytest>=9,<10
+networkx==3.6.1

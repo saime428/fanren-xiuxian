@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.hermes.xiuxian.doufa_demo_player_02.rotation</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>cd /Users/operator/.hermes/workspace/projects/xiuxian &amp;&amp; mkdir -p state &amp;&amp; bash ./scripts/run_doufa_dynamic_rotation.sh &gt;&gt; state/doufa_demo_player_02_rotation.launchd.log 2&gt;&amp;1</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/operator/.hermes/workspace/projects/xiuxian</string>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardErrorPath</key>
+  <string>/Users/operator/.hermes/workspace/projects/xiuxian/state/doufa_demo_player_02_rotation.launchd.log</string>
+</dict>
+</plist>

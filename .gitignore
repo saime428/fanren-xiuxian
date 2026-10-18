@@ -1,0 +1,38 @@
+.venv/
+.env
+.env.*
+!.env.example
+*.session*
+state/
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+# Wrappers scripts/xiuxian_accounts.py render generates for your own accounts
+# (the tracked demo-account wrappers stay tracked).
+/scripts/*_tg[0-9]*.sh
+!/scripts/*_tg91000000[0-9][0-9].sh
+# Account env files and any backup/editor copy of them; only the template is tracked.
+config/accounts/*
+!config/accounts/account.env.example
+
+# Consolidated local references and historical snapshots keep their own history.
+/references/*
+!/references/README.md
+/archive/*
+!/archive/README.md
+
+# Private account data and observed runtime records
+/.maintenance/
+/.private/
+/docs/reports/
+*privacy*map*.json
+*original-values*.json
+*.bundle
+*.sqlite*
+*.db
+*.pem
+*.key
