@@ -524,7 +524,7 @@ def cmd_render(args) -> None:
     active_entries(json.loads(files["config/accounts/active_flows.json"]))
     for name in write_rendered(files, args.out):
         print(name)
-    missing = [row["id"] for row in rows if not (ROOT / accounts_module().DWELLING_SESSIONS[row["id"]]).is_file()]
+    missing = [row["id"] for row in rows if not (args.out / accounts_module().DWELLING_SESSIONS[row["id"]]).is_file()]
     if missing:
         print("还没登录：" + " ".join(missing) + "（执行 login）")
 

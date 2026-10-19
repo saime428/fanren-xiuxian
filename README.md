@@ -7,8 +7,16 @@
 账号和每个账号开哪些功能都写在一份配置里，定时任务由它生成。macOS 和 Linux 都能跑，
 Windows 请用 WSL2。完整步骤见 [用自己的账号](docs/self-service-accounts.md)。
 
+最简单的是本地网页：填 API id/hash 和手机号、输验证码就能加号，功能用勾选框选，最后点「保存并应用」。
+
 ```sh
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python3 scripts/xiuxian_web.py      # 打开 http://127.0.0.1:8765
+```
+
+同样的事也能用命令行做：
+
+```sh
 X=".venv/bin/python3 scripts/xiuxian_accounts.py"
 $X game --group <游戏群> --chat-id <-100…> --topic-id <话题 id> --second-chat-id <-100…>
 $X add tg<你的 Telegram 用户 id> --username <你的用户名>   # 然后在 config/accounts/tg<id>.env 填 API id/hash

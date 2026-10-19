@@ -60,7 +60,9 @@ EXCLUSIVE_FEATURES = (frozenset({"jiaohuan_fabao", "jiaohuan_gongfa"}),)
 
 def config_path() -> Path:
     explicit = os.environ.get("XIUXIAN_ACCOUNTS_FILE")
-    if explicit:
+    # A named file that does not exist yet (the setup tools are about to write
+    # it) leaves the import-time accounts on the demo config.
+    if explicit and Path(explicit).is_file():
         return Path(explicit)
     if os.environ.get("XIUXIAN_EXAMPLE_CONFIG") or not USER_PATH.is_file():
         return EXAMPLE_PATH
