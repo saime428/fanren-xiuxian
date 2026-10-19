@@ -1,9 +1,13 @@
-telethon>=1.36,<2
-python-socks>=2.4,<3
-python-dotenv>=1.0,<2
-requests>=2.31,<3
-httpx>=0.28,<0.29
-websockets>=13,<17
+fastapi
+uvicorn
+jinja2
+pydantic
+python-multipart
+python-dotenv
+# ponytail: pinned to what production runs. 1.45 (layer 229) moved button url/data
+# onto button.type, so every getattr(button, "url"/"data") reader silently gets None.
+# Upgrade path: read through button.type first, then lift the pin.
+telethon==1.44.0
+python-socks[asyncio]
+httpx
 websocket-client>=1.8,<2
-pytest>=9,<10
-networkx==3.6.1

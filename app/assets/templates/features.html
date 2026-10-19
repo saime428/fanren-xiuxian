@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="detail-card">
+    <div class="section-header compact">
+        <p>{{ active_profile.name if active_profile else '未选择档案' }}{% if active_profile and active_profile.telegram_username %} · @{{ active_profile.telegram_username }}{% endif %}</p>
+        <h1>功能勾选</h1>
+    </div>
+    {% if is_new %}
+    <p class="feature-switch-banner">新号已添加：勾上这个号要跑的功能，点最下面的「保存」。</p>
+    {% endif %}
+    <p class="muted">勾好点保存：只有和现在不一样的功能会被切换，开启时的排时间、查资源等都照各功能页原来的规则走。远航路线、各项时间点等细项沿用原设置，要细调请去各功能页。换号用「角色真身」页的档案切换。</p>
+    {% if not command_chat_ready %}
+    <p class="feature-switch-banner">这个号还没有可用的游戏群绑定，多数功能开不了。</p>
+    {% endif %}
+</section>
+
+{% if results is not none %}
+<section class="detail-card">
+    <div class="section-header compact"><h2>保存结果</h2></div>
+    {% if results %}
+    <ul class="feature-switch-results">
+        {% for item in results %}
+        <li class="{{ 'is-ok' if item.ok else 'is-failed' }}"><strong>{{ item.label }}</strong>：{{ item.detail }}</li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="muted">没有需要改的功能。</p>
+    {% endif %}
+</section>
+{% endif %}
+
+<form method="post" action="/features" data-global-loading data-loading-message="正在按勾选切换功能">
+    {% for group in groups %}
+    <section class="detail-card">
+        <div class="section-header compact"><h2>{{ group }}</h2></div>
+        <div class="feature-switch-grid">
+            {% for row in rows if row.group == group %}
+            <div class="feature-switch{% if row.blocked %} is-blocked{% endif %}">
+                <label>
+                    {% if not row.blocked %}<input type="hidden" name="present" value="{{ row.key }}">{% endif %}
+                    <input type="checkbox" name="on" value="{{ row.key }}" {% if row.enabled %}checked{% endif %} {% if row.blocked %}disabled{% endif %}>
+                    <span>{{ row.label }}</span>
+                </label>
+                {% if row.choices %}
+                <select name="choice_{{ row.key }}" aria-label="{{ row.label }}选项" {% if row.blocked %}disabled{% endif %}>
+                    {% for value, text in row.choices %}
+                    <option value="{{ value }}" {% if value == row.choice %}selected{% endif %}>{{ text }}</option>
+                    {% endfor %}
+                </select>
+                {% endif %}
+                {% if row.blocked %}<small>{{ row.blocked }}</small>{% elif row.note %}<small>{{ row.note }}</small>{% endif %}
+            </div>
+            {% endfor %}
+        </div>
+    </section>
+    {% endfor %}
+    <div class="action-row">
+        <button type="submit" class="inline-button auto-toggle-button active">保存</button>
+    </div>
+</form>
+{% endblock %}

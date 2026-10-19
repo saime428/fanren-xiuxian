@@ -1,0 +1,139 @@
+import time
+from typing import Optional
+import biz_fanren_game
+import biz_fishing_game
+from tg_game import pagoda_auto
+from tg_game.features.fishing import biz_fishing_daily_auto
+
+FISHING_STATE_LABELS = {
+    "idle": "待开钓",
+    "catch_success": "提竿成功",
+    "miniapp_canary": "等待 MiniApp 试钓",
+    "miniapp_batch": "等待 MiniApp 钓满今日",
+    "miniapp_canary_running": "MiniApp 试钓中",
+    "miniapp_batch_running": "MiniApp 钓满今日中",
+    "miniapp_failed": "MiniApp 失败",
+    "finished": "今日竿数已满",
+    "stopped": "已停止",
+}
+
+
+def _int_value(value: object, default: int = 0) -> int:
+    try:
+        return int(value if value is not None else default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_value(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value if value is not None else default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _session_text(session: dict, key: str, default: str = "") -> str:
+    return str(session.get(key) or default).strip() or default
+
+
+def _sorted_items(value: object) -> list[tuple]:
+    return sorted(value.items(), key=lambda item: item[0]) if isinstance(value, dict) else []
+
+
+def build_fishing_view(raw_session: Optional[dict], daily_task: Optional[dict] = None, payload: Optional[dict] = None, *, payload_updated_at: float = 0, game_items: Optional[dict] = None) -> dict:
+    # web 包会反向导入本模块，格式化工具延迟到渲染时加载。
+    from tg_game.web.biz_web_display_formatting import coerce_json_dict
+    session = raw_session or {}
+    rod_info = biz_fishing_game.fishing_rod_from_inventory(payload)
+    task = daily_task or {}
+    state = _session_text(session, "state", "idle")
+    daily_count = max(_int_value(session.get("daily_count")), 0)
+    daily_limit = max(
+        _int_value(session.get("daily_limit"), biz_fishing_game.FISHING_DAILY_LIMIT), 1
+    )
+    if rod_info.get("daily_limit"):
+        daily_limit = max(int(rod_info["daily_limit"]), 1)
+    next_action_at = _float_value(session.get("next_action_at"))
+    pond = _session_text(session, "pond", biz_fishing_game.FISHING_DEFAULT_POND)
+    bait = _session_text(session, "bait", biz_fishing_game.FISHING_DEFAULT_BAIT)
+
+    last_result_text = _session_text(session, "last_result_text")
+    canary_passed = (
+        state in {"catch_success", "finished"}
+        and "MiniApp" in last_result_text
+        and not _session_text(session, "last_error")
+    )
+    daily_next_run_at = _float_value(task.get("next_run_at"))
+    daily_auto_enabled = bool(_int_value(task.get("enabled")))
+    daily_run_time = biz_fishing_daily_auto.normalize_run_time(
+        task.get("strategy") or biz_fishing_daily_auto.DEFAULT_RUN_TIME
+    )
+    # 会话里的"今日竿数"只在每日自动跑完（默认 05:30）才刷新，零点到那之前页面还是昨天的数——
+    # 过了当天就明说，别让 5/5 看起来像没更新。
+    updated_at = _float_value(session.get("updated_at")) or _float_value(session.get("last_action_at"))
+    catches, baits = _sorted_items(session.get("catches")), _sorted_items(session.get("baits"))
+    materials = coerce_json_dict((payload or {}).get("inventory")).get("materials")
+    inventory_from_tianji = isinstance(materials, dict) and payload_updated_at >= updated_at
+    if inventory_from_tianji:
+        catches, baits = [], []
+        for item_id, count in materials.items():
+            if _int_value(count) <= 0:
+                continue
+            name = str(((game_items or {}).get(item_id) or {}).get("name") or item_id)
+            if item_id.startswith("mat_fish_") and item_id not in {"mat_fish_meat", "mat_fish_scale"}:
+                catches.append((name, _int_value(count)))
+            elif item_id.startswith("item_fishing_bait_"):
+                baits.append((name, _int_value(count)))
+        catches.sort()
+        baits.sort()
+    is_today = pagoda_auto.is_same_local_day(updated_at, time.time())
+    state_label = FISHING_STATE_LABELS.get(state, state)
+    daily_text = f"{daily_count}/{daily_limit}"
+    if updated_at and not is_today:
+        last_day = time.strftime("%m-%d", time.localtime(updated_at))
+        daily_text = f"今日未开钓 · 上次 {daily_count}/{daily_limit}（{last_day}）" + (
+            f" · {daily_run_time} 自动开钓" if daily_auto_enabled else ""
+        )
+        if state == "finished":
+            state_label = "待今日开钓"
+
+    return {
+        "raw": session,
+        "active": bool(_int_value(session.get("enabled"))),
+        "state": state,
+        "state_label": state_label,
+        "updated_at": updated_at,
+        "updated_display": biz_fanren_game.format_timestamp(updated_at) if updated_at else "-",
+        "pond": pond,
+        "bait": bait,
+        "pond_options": biz_fishing_game.FISHING_POND_OPTIONS,
+        "bait_options": biz_fishing_game.FISHING_BAIT_OPTIONS,
+        "bait_source": biz_fishing_game.normalize_bait_source(session.get("bait_source")),
+        "bait_source_options": biz_fishing_game.FISHING_BAIT_SOURCE_OPTIONS,
+        "daily_count": daily_count,
+        "daily_limit": daily_limit,
+        "daily_text": daily_text,
+        "rod_text": str(rod_info.get("rod_text") or "").strip() or _session_text(session, "rod_text", "-"),
+        "baits": baits,
+        "catches": catches,
+        "inventory_source": "天机阁" if inventory_from_tianji else "鱼篓回包/垂钓记录",
+        "inventory_updated_display": biz_fanren_game.format_timestamp(payload_updated_at if inventory_from_tianji else updated_at),
+        "last_fish_name": _session_text(session, "last_fish_name", "-"),
+        "last_result_text": last_result_text,
+        "canary_passed": canary_passed,
+        "daily_auto_enabled": daily_auto_enabled,
+        "daily_run_time": daily_run_time,
+        "daily_next_run_at": daily_next_run_at,
+        "daily_next_run_display": (
+            biz_fanren_game.format_timestamp(daily_next_run_at)
+            if daily_next_run_at
+            else "-"
+        ),
+        "daily_last_error": _session_text(task, "last_error"),
+        "last_command_text": _session_text(session, "last_command_text"),
+        "last_error": _session_text(session, "last_error"),
+        "next_action_at": next_action_at,
+        "next_action_display": (
+            biz_fanren_game.format_timestamp(next_action_at) if next_action_at else "-"
+        ),
+    }

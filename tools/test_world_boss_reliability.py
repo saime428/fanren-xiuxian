@@ -1,0 +1,740 @@
+"""Regression checks for real send timing, late tickets and per-window jitter.
+
+python tools/test_world_boss_reliability.py
+No Telegram or real HTTP is used. Temporary files follow the platform temp dir.
+"""
+import asyncio
+import logging
+import random
+from pathlib import Path
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
+from datetime import datetime, timezone
+from email.utils import format_datetime
+
+from test_world_boss_combat import Clock, ENTRY, boss, monitor_for, window
+import test_world_boss_timing_replay as replay
+from tg_game.features.world_boss.world_boss_combat_loop import run_combat_loop
+from tg_game.features.world_boss.world_boss_timing import CombatTiming
+from tg_game.features.world_boss import world_boss_support as support
+
+
+class RealtimeServer:
+    def __init__(self):
+        self.started = threading.Event()
+        self.starts_at = 0.0
+        self.charged_at = 0.0
+        self.hit_at = None
+        self.challenge = {
+            "challengeId": "offline-realtime", "durationMs": 2200,
+            "maxDurationMs": 2200, "phase": 1,
+            "windows": [window(0, 1600)], "windowCount": 1,
+        }
+
+    async def post(self, origin, path, payload, timeout):
+        endpoint = path.rsplit("/", 1)[-1]
+        if endpoint == "begin":
+            await asyncio.sleep(.02)
+            self.starts_at = time.monotonic() + .1
+            self.started.set()
+            return {"ok": True, "startsInMs": 100}
+        if endpoint == "charge-start":
+            await asyncio.sleep(.005)
+            self.charged_at = time.monotonic()
+            return {"ok": True, "chargeTicket": "offline-ticket"}
+        if endpoint == "hit":
+            await asyncio.sleep(.005)
+            self.hit_at = time.monotonic()
+            delta = abs((self.hit_at - self.starts_at) * 1000 - 1600)
+            hold = (self.hit_at - self.charged_at) * 1000
+            return {"ok": True, "hit": {
+                "damageYi": 2, "deltaMs": delta, "holdMs": hold,
+                "perfect": delta <= 150 and 520 <= hold <= 1250,
+            }}
+        if endpoint == "finish":
+            return {"ok": True, "result": {"grade": "A", "score": 100, "player_hp": 100}}
+        raise AssertionError(endpoint)
+
+
+class ReliabilityChecks(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_hit_followed_by_slow_charge_keeps_recovery_margin(self):
+        # The first late hit must not cut the next hold to ~730 ms. A slow
+        # charge then leaves too little ticket age, even when its hit is on time.
+        for seed in range(20):
+            clock = Clock()
+            server = replay.TimedServer(clock)
+            server.starts_at = 0
+            server.windows = [dict(w, perfectMs=210) for w in server.windows]
+
+            async def post(origin, path, payload, timeout):
+                if path.endswith('/hit') and payload['windowId'] == 'w0':
+                    await clock.sleep(.45)
+                if path.endswith('/charge-start') and payload['windowId'] != 'w0':
+                    await clock.sleep(.60)
+                return await server.post(origin, path, payload, timeout)
+
+            with tempfile.TemporaryDirectory() as directory:
+                monitor, _ = monitor_for(Path(directory), clock)
+                monitor.post_json = post
+                monitor._timing = CombatTiming(rng=random.Random(seed))
+                monitor._start_combat(server.challenge, {'maxHp': 100}, 0, server.windows)
+                try:
+                    for index, target in enumerate(server.windows):
+                        result = await clock.run(monitor._hit_window(
+                            ENTRY, 'offline', 'offline', 'offline', 0, target, index))
+                        if index:
+                            self.assertTrue(result['accepted_perfect'], (seed, index, result['diagnostic']))
+                        self.assertEqual(result['action']['holdMs'],
+                                         result['diagnostic']['sent_elapsed_ms']
+                                         - result['diagnostic']['charge']['requested_elapsed_ms'])
+                finally:
+                    await monitor.stop()
+
+    async def test_repeated_hold_skew_still_reduces_overcharging(self):
+        for seed in range(10):
+            clock = Clock()
+            server = replay.TimedServer(clock)
+            server.starts_at = 0
+            server.windows = [dict(window(i, 2000 + 3500 * i), perfectMs=210) for i in range(8)]
+
+            async def post(origin, path, payload, timeout):
+                if path.endswith('/hit'):
+                    await clock.sleep(.18)
+                return await server.post(origin, path, payload, timeout)
+
+            with tempfile.TemporaryDirectory() as directory:
+                monitor, _ = monitor_for(Path(directory), clock)
+                monitor.post_json = post
+                monitor._timing = CombatTiming(rng=random.Random(seed))
+                monitor._start_combat(server.challenge, {'maxHp': 100}, 0, server.windows)
+                try:
+                    for index, target in enumerate(server.windows):
+                        result = await clock.run(monitor._hit_window(
+                            ENTRY, 'offline', 'offline', 'offline', 0, target, index))
+                        if index >= 1:
+                            self.assertGreaterEqual(result['diagnostic']['server_hold_ms'], 520)
+                            self.assertLessEqual(result['diagnostic']['server_hold_ms'], 1250)
+                finally:
+                    await monitor.stop()
+
+    async def test_repeated_extreme_skew_is_confirmed_and_learned(self):
+        clock = Clock()
+        server = replay.TimedServer(clock)
+        server.starts_at = 0
+        server.windows = [dict(window(i, 2000 + 3500 * i), perfectMs=210) for i in range(8)]
+
+        async def post(origin, path, payload, timeout):
+            if path.endswith('/hit'):
+                await clock.sleep(.40)
+            return await server.post(origin, path, payload, timeout)
+
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _ = monitor_for(Path(directory), clock)
+            monitor.post_json = post
+            monitor._timing = CombatTiming(rng=random.Random(0))
+            monitor._start_combat(server.challenge, {'maxHp': 100}, 0, server.windows)
+            hits = []
+            try:
+                for index, target in enumerate(server.windows):
+                    result = await clock.run(monitor._hit_window(
+                        ENTRY, 'offline', 'offline', 'offline', 0, target, index))
+                    hits.append(result['diagnostic'])
+                self.assertEqual(hits[0]['hold_feedback'], 'late_hit_spike_pending')
+                self.assertEqual(hits[1]['hold_feedback'], 'repeated_late_hit_skew')
+                self.assertTrue(all(520 <= h['server_hold_ms'] <= 1250 for h in hits[2:]), hits)
+                monitor._reset_hold_skew()
+                self.assertFalse(monitor._pending_hold_spike)
+            finally:
+                await monitor.stop()
+
+    async def test_isolated_request_spikes_do_not_shrink_later_holds(self):
+        # 2026-10-10: the server answered single requests 200..850ms late between
+        # normal ones.  Those windows must not teach the controller a shorter hold.
+        clock = Clock()
+        server = replay.TimedServer(clock)
+        server.starts_at = 0
+        server.windows = [dict(window(i, 2000 + 3500 * i), perfectMs=210) for i in range(8)]
+        spikes = {server.windows[2]['id'], server.windows[5]['id']}
+
+        async def post(origin, path, payload, timeout):
+            if path.endswith('/hit') and payload.get('windowId') in spikes:
+                await clock.sleep(.25)
+            return await server.post(origin, path, payload, timeout)
+
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _ = monitor_for(Path(directory), clock)
+            monitor.post_json = post
+            monitor._timing = CombatTiming(rng=random.Random(0))
+            monitor._start_combat(server.challenge, {'maxHp': 100}, 0, server.windows)
+            hits = []
+            try:
+                for index, target in enumerate(server.windows):
+                    result = await clock.run(monitor._hit_window(
+                        ENTRY, 'offline', 'offline', 'offline', 0, target, index))
+                    hits.append(result['diagnostic'])
+                self.assertEqual([h['hold_feedback'] for h in hits],
+                                 ['observed'] * 2 + ['request_spike_skipped'] + ['observed'] * 2
+                                 + ['request_spike_skipped'] + ['observed'] * 2, hits)
+                self.assertGreaterEqual(hits[2]['request_excess_ms'], 200)
+                self.assertLess(abs(monitor._hold_skew_ms), 20, hits)
+                for h in hits[3:5] + hits[6:]:
+                    self.assertLess(abs(h['server_hold_ms'] - h['hold_ms']), 40, h)
+            finally:
+                await monitor.stop()
+
+    async def test_three_slow_hits_preserve_holds_after_requests_recover(self):
+        for seed in range(10):
+            clock = Clock()
+            server = replay.TimedServer(clock)
+            server.starts_at = 0
+            server.windows = [dict(window(i, 2000 + 3500 * i), perfectMs=210) for i in range(12)]
+            server.challenge.update(durationMs=45000, maxDurationMs=45000, windowCount=12)
+            # Approximate today's hit-response burst, without contacting the game.
+            delays = {'w5': .35, 'w6': .71, 'w7': .48}
+
+            async def post(origin, path, payload, timeout):
+                if path.endswith('/hit'):
+                    await clock.sleep(delays.get(payload.get('windowId'), 0))
+                return await server.post(origin, path, payload, timeout)
+
+            with tempfile.TemporaryDirectory() as directory:
+                monitor, _ = monitor_for(Path(directory), clock)
+                monitor.post_json = post
+                monitor._timing = CombatTiming(rng=random.Random(seed))
+                monitor._start_combat(server.challenge, {'maxHp': 100}, 0, server.windows)
+                hits = []
+                try:
+                    for index, target in enumerate(server.windows):
+                        result = await clock.run(monitor._hit_window(
+                            ENTRY, 'offline', 'offline', 'offline', 0, target, index))
+                        hits.append(result['diagnostic'])
+                    for hit in hits[8:]:
+                        self.assertEqual(hit['hold_reserve_ms'], 100, (seed, hit))
+                        self.assertGreaterEqual(hit['planned_hold_ms'], 1050, (seed, hit))
+                        self.assertTrue(hit['accepted_perfect'], (seed, hit))
+                finally:
+                    await monitor.stop()
+
+    async def test_token_replacement_does_not_bypass_retry_after(self):
+        clock, calls = Clock(), []
+        delay = 3
+
+        async def post(*args):
+            calls.append(clock.now)
+            if len(calls) == 1:
+                raise boss.MiniAppBeastError("turnstile_required", 403)
+            if len(calls) == 2:
+                raise boss.MiniAppBeastError("server_busy", 429, retry_after=delay)
+            return {"ok": True, "startsInMs": 100}
+
+        async def token(*args):
+            await clock.sleep(.1)
+            return "offline-token", ""
+
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _ = monitor_for(Path(directory), clock)
+            monitor.post_json = post
+            monitor._wait_for_turnstile_token = token
+            try:
+                await clock.run(monitor._begin_with_turnstile(ENTRY, "offline", "offline", "offline", "主魂"))
+                self.assertEqual(len(calls), 3)
+                self.assertGreaterEqual(calls[2] - calls[1], 3)
+                calls.clear()
+                delay = 30
+                with self.assertRaises(boss.MiniAppBeastError):
+                    await clock.run(monitor._begin_with_turnstile(ENTRY, "offline", "offline", "offline", "主魂"))
+                self.assertEqual(len(calls), 2, "Long cooldown was bypassed by another token")
+            finally:
+                await monitor.stop()
+
+    async def begin_with_prefetch(self, *, prefetch_state, accept):
+        """Run /begin after a join-window prefetch; accept(token or None) -> bool."""
+        clock, tokens = Clock(), []
+
+        async def post(origin, path, payload, timeout):
+            tokens.append(payload.get("turnstileToken"))
+            await clock.sleep(.03 if tokens[-1] is None else .3)  # siteverify is slow
+            if not accept(tokens[-1]):
+                raise boss.MiniAppBeastError("turnstile_failed", 403)
+            return {"ok": True, "startsInMs": 100}
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        monitor, _ = monitor_for(Path(directory.name), clock)
+        self.addAsyncCleanup(monitor.stop)
+        monitor.post_json = post
+        broker = monitor.turnstile_broker
+        monitor._prefetch_turnstile(ENTRY, "主魂")
+        prefetch_id = monitor._turnstile_prefetch_id
+        self.assertTrue(prefetch_id)
+        if prefetch_state == "ready":
+            broker.submit_token(prefetch_id, "prefetched-token")
+        elif prefetch_state == "cancelled":
+            broker.cancel(prefetch_id, reason="turnstile_interaction_required")
+        create = broker.create_request
+
+        def browser(**kwargs):  # the worker answers every fresh request at once
+            request = create(**kwargs)
+            broker.submit_token(request["request_id"], f"fresh-{len(broker.list_requests(include_finished=True))}")
+            return request
+
+        broker.create_request = browser
+        trace, error = {}, None
+        try:
+            await clock.run(monitor._begin_with_turnstile(ENTRY, "主魂", "init", "session", "challenge-1", trace=trace))
+        except boss.MiniAppBeastError as exc:
+            error = exc
+        return SimpleNamespace(tokens=tokens, trace=trace, error=error, clock=clock, monitor=monitor,
+                               prefetch=broker.get_request(prefetch_id),
+                               requests=broker.list_requests(include_finished=True))
+
+    async def test_prefetched_token_skips_the_twelve_second_browser_wait(self):
+        run = await self.begin_with_prefetch(prefetch_state="ready", accept=lambda token: token is not None)
+        self.assertIsNone(run.error)
+        # The ~30 ms token-less probe stays: it is the clock's network RTT reference.
+        self.assertEqual(run.tokens, [None, "prefetched-token"])
+        self.assertLess(run.clock.now, .5, "polled for the browser although the token was ready")
+        self.assertEqual(len(run.requests), 1, "queued a fresh verification despite the prefetch")
+        self.assertEqual(run.prefetch["status"], "accepted")
+        self.assertTrue(run.trace["turnstile_handoffs"][0]["prefetched"])
+        self.assertEqual(run.trace["clock_rtt_source"], "pre_verification_begin")
+        self.assertEqual(run.monitor._turnstile_prefetch_id, "")
+
+    async def test_rejected_prefetch_falls_back_with_the_original_budget(self):
+        run = await self.begin_with_prefetch(prefetch_state="ready", accept=lambda token: str(token).startswith("fresh"))
+        self.assertIsNone(run.error)
+        self.assertEqual(run.tokens[:2], [None, "prefetched-token"])
+        self.assertTrue(run.tokens[2].startswith("fresh"))
+        self.assertEqual(run.prefetch["status"], "rejected")
+        # Probe, prefetch, then the two fresh tokens the original flow had.
+        run = await self.begin_with_prefetch(prefetch_state="ready", accept=lambda token: False)
+        self.assertEqual(run.error.code, "turnstile_failed")
+        self.assertEqual(len(run.tokens), 4)
+        self.assertEqual(len({t for t in run.tokens[2:]}), 2, "a fresh token was replayed")
+
+    async def test_failed_prefetch_requests_a_fresh_token_without_another_begin(self):
+        run = await self.begin_with_prefetch(prefetch_state="cancelled", accept=lambda token: token is not None)
+        self.assertIsNone(run.error)
+        self.assertEqual(len(run.tokens), 2)
+        self.assertTrue(run.tokens[1].startswith("fresh"))
+        self.assertFalse(run.trace["turnstile_handoffs"][0]["prefetched"])
+
+    async def test_unused_prefetch_is_cancelled_when_entry_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _ = monitor_for(Path(directory), Clock())
+            try:
+                async def player_id(identity):
+                    return None
+
+                async def no_challenge(*args, **kwargs):
+                    raise boss.MiniAppBeastError("boss_action_limit", 409)
+
+                monitor._identity_player_id = player_id
+                monitor._wait_for_challenge = no_challenge
+                with self.assertRaises(boss.MiniAppBeastError):
+                    await monitor._participate(ENTRY, "主魂", init_data="init")
+                [request] = monitor.turnstile_broker.list_requests(include_finished=True)
+                self.assertEqual((request["status"], request["cancel_reason"]), ("cancelled", "turnstile_prefetch_unused"))
+                self.assertEqual(monitor._turnstile_prefetch_id, "")
+            finally:
+                await monitor.stop()
+
+    async def test_first_latency_spike_does_not_poison_following_windows(self):
+        for seed in range(20):
+            clock = Clock()
+            server = replay.TimedServer(clock)
+            server.starts_at = 0
+            server.windows = [dict(w, perfectMs=210) for w in server.windows]
+            hit_count = 0
+
+            async def post(origin, path, payload, timeout):
+                nonlocal hit_count
+                if path.endswith("/hit"):
+                    hit_count += 1
+                    if hit_count == 1:
+                        await clock.sleep(.45)
+                return await server.post(origin, path, payload, timeout)
+
+            with tempfile.TemporaryDirectory() as directory:
+                monitor, _ = monitor_for(Path(directory), clock)
+                monitor.post_json = post
+                monitor._timing = CombatTiming(rng=random.Random(seed))
+                monitor._start_combat(server.challenge, {"maxHp": 100}, 0, server.windows)
+                try:
+                    with patch.object(boss, "WORLD_BOSS_HOLD_MS", 1000):
+                        for index, target in enumerate(server.windows):
+                            result = await clock.run(monitor._hit_window(ENTRY, "offline", "offline", "offline", 0, target))
+                            if index:
+                                self.assertTrue(result["accepted_perfect"], (seed, index, result["diagnostic"]))
+                finally:
+                    await monitor.stop()
+
+    async def test_retry_honors_server_delay_and_request_budget(self):
+        for delay, expected in ((.8, 2), (5, 1)):
+            clock, calls = Clock(), []
+
+            async def post(*args):
+                calls.append(clock.now)
+                if len(calls) == 1:
+                    error = boss.MiniAppBeastError("server_busy", 429)
+                    error.retry_after = delay
+                    raise error
+                return {"ok": True}
+
+            with tempfile.TemporaryDirectory() as directory:
+                monitor, _ = monitor_for(Path(directory), clock)
+                monitor.post_json = post
+                try:
+                    operation = monitor._request(ENTRY.origin, support.API_PREFIX + "window", {}, retries=1, timeout=2)
+                    if expected == 1:
+                        with self.assertRaises(boss.MiniAppBeastError):
+                            await clock.run(operation)
+                    else:
+                        await clock.run(operation)
+                        self.assertGreaterEqual(calls[1] - calls[0], delay)
+                    self.assertEqual(len(calls), expected)
+                finally:
+                    await monitor.stop()
+
+    async def test_hit_gateway_failure_is_not_replayed(self):
+        clock, hits = Clock(), []
+        server = replay.TimedServer(clock)
+        server.starts_at = 0
+
+        async def post(origin, path, payload, timeout):
+            if path.endswith("/hit"):
+                hits.append(dict(payload))
+                await clock.sleep(.02)
+                raise boss.MiniAppBeastError("request_failed", 502)
+            return await server.post(origin, path, payload, timeout)
+
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _ = monitor_for(Path(directory), clock)
+            monitor.post_json = post
+            monitor._start_combat(server.challenge, {"maxHp": 100}, 0, server.windows)
+            try:
+                result = await clock.run(monitor._hit_window(ENTRY, "offline", "offline", "offline", 0, server.windows[0]))
+                self.assertFalse(result["ok"])
+                self.assertEqual(len(hits), 1)
+            finally:
+                await monitor.stop()
+
+    async def test_cancellation_joins_private_loop_cleanup(self):
+        started, finished = threading.Event(), threading.Event()
+
+        async def operation():
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            finally:
+                await asyncio.sleep(.03)
+                finished.set()
+
+        task = asyncio.create_task(run_combat_loop(operation))
+        while not started.is_set():
+            await asyncio.sleep(.001)
+        task.cancel()
+        await asyncio.sleep(.005)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(finished.is_set(), "Caller escaped while the battle was still active")
+
+    async def test_database_stop_is_checked_inside_private_loop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            template, enabled = monitor_for(Path(directory), Clock())
+            server = RealtimeServer()
+            monitor = boss.WorldBossMonitor(template.actor, "offline-stop", post_json=server.post,
+                                             turnstile_broker=template.turnstile_broker)
+            task = asyncio.create_task(monitor._fight(ENTRY, "offline", "offline", {
+                "challenge": server.challenge, "player": {"maxHp": 100},
+            }))
+            try:
+                while not server.started.is_set():
+                    await asyncio.sleep(.005)
+                enabled["value"] = False
+                with self.assertRaises(boss._WorldBossDisabledError):
+                    await asyncio.wait_for(task, 1)
+                self.assertIsNone(server.hit_at)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                await monitor.stop()
+
+    async def delayed_charge(self, delay, base_hold, *, returning=False):
+        clock = Clock()
+        server = replay.TimedServer(clock)
+        server.starts_at = 0
+        target = dict(server.windows[0], perfectMs=210)
+        server.windows = [target]
+
+        async def post(origin, path, payload, timeout):
+            charge = path.endswith("/charge-start")
+            if charge and not returning:
+                await clock.sleep(delay)
+            result = await server.post(origin, path, payload, timeout)
+            if charge and returning:
+                await clock.sleep(delay)
+            return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _ = monitor_for(Path(directory), clock, server)
+            monitor.post_json = post
+            monitor._start_combat(server.challenge, {"maxHp": 100}, 0, [target])
+            try:
+                with patch.object(boss, "WORLD_BOSS_HOLD_MS", base_hold):
+                    result = await clock.run(monitor._hit_window(ENTRY, "offline", "offline", "offline", 0, target))
+            finally:
+                await monitor.stop()
+        hit = result["diagnostic"]
+        self.assertEqual(hit["hold_ms"], hit["actual_elapsed_ms"] - hit["charge"]["requested_elapsed_ms"])
+        return hit
+
+    async def test_late_ticket_uses_remaining_perfect_window(self):
+        for returning in (False, True):
+            hit = await self.delayed_charge(.600, 1000, returning=returning)
+            self.assertTrue(hit["accepted_perfect"], hit)
+            self.assertGreater(hit["late_charge_adjustment_ms"], 0)
+
+    async def test_uncertain_ticket_does_not_overcharge_slow_response(self):
+        for returning in (False, True):
+            hit = await self.delayed_charge(.750, 1180, returning=returning)
+            self.assertFalse(hit["hold_guard"]["feasible"], hit)
+            self.assertEqual(hit["late_charge_adjustment_ms"], 0, hit)
+            self.assertEqual(hit["accepted_perfect"], returning, hit)
+            self.assertEqual(hit["charge_recovery"], "no_safe_interval")
+
+    async def test_main_event_loop_stall_does_not_delay_combat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            template, _ = monitor_for(root, Clock())
+            template.actor.config["world_boss"]["timing_jitter"] = False
+            server = RealtimeServer()
+            monitor = boss.WorldBossMonitor(
+                template.actor, "offline-isolated", post_json=server.post,
+                turnstile_broker=template.turnstile_broker,
+            )
+            task = asyncio.create_task(monitor._fight(
+                ENTRY, "offline-init", "offline-session",
+                {"challenge": server.challenge, "player": {"maxHp": 100}},
+            ))
+            try:
+                while not server.started.is_set():
+                    await asyncio.sleep(.005)
+                await asyncio.sleep(max(0, server.starts_at + 1.50 - time.monotonic()))
+                # Reproduce a synchronous task blocking the Telegram event loop.
+                time.sleep(.35)
+                result = await task
+                self.assertEqual(result["perfect_count"], 1, result["diagnostics"]["hits"])
+                self.assertLess(result["diagnostics"]["hits"][0]["wake_lateness_ms"], 100)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                await monitor.stop()
+
+    async def test_jittered_battle_preserves_perfect_hits_and_truthful_times(self):
+        clock = Clock()
+        server = replay.TimedServer(clock, reveal_lead_ms=1500)
+        server.windows = [window(i, 2000 + 3500 * i) for i in range(16)]
+        server.challenge.update(windowCount=16, durationMs=60000, maxDurationMs=60000)
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _ = monitor_for(Path(directory), clock, server)
+            monitor._timing_jitter = True
+            monitor._timing_rng = random.Random(42)
+            monitor.post_json = None
+
+            async def post(origin, path, payload, timeout, **kwargs):
+                if path.endswith("/begin"):
+                    server.starts_at = clock.now + .110
+                    await clock.sleep(.020)
+                    kwargs["timing"].update(transport_ms=20, loop_resume_ms=0, executor_queue_ms=0)
+                    return {"ok": True, "startsInMs": 100}
+                return await server.post(origin, path, payload, timeout)
+
+            original = CombatTiming.plan
+            with patch.object(boss, "_post_json", post), \
+                    patch.object(CombatTiming, "plan", autospec=True, side_effect=original) as plan:
+                result = await clock.run(monitor._run_identity(ENTRY, "主魂", "offline"))
+            await monitor.stop()
+        hits = result["diagnostics"]["hits"]
+        self.assertEqual(plan.call_count, 16, "Replanning a strike consumed new random draws")
+        self.assertEqual(result["perfect_count"], 16, hits)
+        self.assertGreater(len({h["timing_offset_ms"] for h in hits}), 8)
+        self.assertGreater(len({h["planned_hold_ms"] for h in hits}), 8)
+        self.assertLess(abs(result["diagnostics"]["strategy"]["drift_lead_ms"]), 10,
+                        "The network estimator learned the intentional action offset")
+        for hit, action in zip(hits, server.proof["actions"]):
+            self.assertEqual(hit["actual_elapsed_ms"], hit["sent_elapsed_ms"])
+            self.assertEqual(action["t"], hit["sent_elapsed_ms"])
+            self.assertEqual(action["holdMs"], hit["sent_elapsed_ms"] - hit["charge"]["requested_elapsed_ms"])
+
+
+class DistributionChecks(unittest.TestCase):
+    def test_variable_extreme_skew_does_not_remain_pending_forever(self):
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _ = monitor_for(Path(directory), Clock())
+            feedback = []
+            for error in (400, 550) * 5:
+                _, state = monitor._observe_hold_feedback(
+                    1000 + error, 1000, late_delta_ms=400, perfect_ms=210)
+                feedback.append(state)
+            self.assertEqual(feedback[0], 'late_hit_spike_pending')
+            self.assertTrue(all(state == 'repeated_late_hit_skew' for state in feedback[1:]))
+            self.assertGreater(monitor._hold_skew_ms, 300)
+            monitor._observe_hold_feedback(1000, 1000, late_delta_ms=None, perfect_ms=210)
+            self.assertFalse(monitor._pending_hold_spike)
+            _, state = monitor._observe_hold_feedback(1500, 1000, late_delta_ms=400, perfect_ms=210)
+            self.assertEqual(state, 'late_hit_spike_pending')
+
+    def test_request_spike_feedback_is_skipped_at_most_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _ = monitor_for(Path(directory), Clock())
+            # 10-10 丙真人第 5/7 击：请求比本场基线慢 273/186 ms，误差 275/166 都在多出的耗时之内。
+            for excess, error in ((273, 275), (186, 166)):
+                _, state = monitor._observe_hold_feedback(
+                    1000 + error, 1000, late_delta_ms=200, perfect_ms=210, request_excess_ms=excess)
+                self.assertEqual(state, 'request_spike_skipped')
+            self.assertEqual(monitor._hold_skew_ms, 0.0)
+            # A third spike in a row is learned: a route that stays slow is real.
+            _, state = monitor._observe_hold_feedback(
+                1200, 1000, late_delta_ms=200, perfect_ms=210, request_excess_ms=250)
+            self.assertEqual(state, 'observed')
+            self.assertGreater(monitor._hold_skew_ms, 0)
+            # A normal sample resets the streak; an error the request cannot explain is learned.
+            monitor._observe_hold_feedback(1000, 1000, late_delta_ms=None, perfect_ms=210)
+            for excess, error in ((50, 150), (None, 150), (200, 400)):
+                _, state = monitor._observe_hold_feedback(
+                    1000 + error, 1000, late_delta_ms=100, perfect_ms=210, request_excess_ms=excess)
+                self.assertEqual(state, 'observed', (excess, error))
+            # The 10-04 extreme rule still wins over the request rule.
+            _, state = monitor._observe_hold_feedback(
+                1500, 1000, late_delta_ms=400, perfect_ms=210, request_excess_ms=600)
+            self.assertEqual(state, 'late_hit_spike_pending')
+
+    def test_three_extreme_request_spikes_do_not_poison_recovered_holds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _ = monitor_for(Path(directory), Clock())
+            monitor._timing.enabled = True
+            for _ in range(5):
+                monitor._observe_hold_feedback(1110, 1110, late_delta_ms=10, perfect_ms=210,
+                                               request_excess_ms=0)
+            feedback = []
+            # 10-12 demo_main hits 6..8: server hold minus truthful local hold.
+            for server, local, delta, excess in (
+                (1445.7, 1121, 296.7, 346),
+                (1775.4, 1123, 670.7, 707),
+                (1489.1, 1109, 403.8, 472),
+            ):
+                _, state = monitor._observe_hold_feedback(
+                    server, local, late_delta_ms=delta, perfect_ms=210,
+                    request_excess_ms=excess)
+                feedback.append(state)
+            self.assertEqual(feedback, ['late_hit_spike_pending'] + ['request_spike_skipped'] * 2)
+            plan = monitor._timing.plan(210, monitor._planned_hold_ms(), monitor._hold_skew_ms)
+            self.assertEqual(plan.hold_reserve_ms, 100)
+            self.assertGreaterEqual(plan.hold_ms, 1050)
+            monitor._observe_hold_feedback(825, 825, late_delta_ms=1, perfect_ms=210,
+                                           request_excess_ms=0)
+            self.assertFalse(monitor._pending_hold_spike)
+            self.assertEqual(monitor._request_spike_skips, 0)
+
+    def test_sustained_extreme_request_latency_is_still_learned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _ = monitor_for(Path(directory), Clock())
+            monitor._timing.enabled = True
+            feedback = []
+            for _ in range(4):
+                _, state = monitor._observe_hold_feedback(
+                    1500, 1000, late_delta_ms=400, perfect_ms=210,
+                    request_excess_ms=550)
+                feedback.append(state)
+            self.assertEqual(feedback, ['late_hit_spike_pending']
+                             + ['request_spike_skipped'] * 2 + ['repeated_late_hit_skew'])
+            self.assertGreater(monitor._hold_skew_ms, 0)
+            self.assertGreater(monitor._timing.plan(
+                210, monitor._planned_hold_ms(), monitor._hold_skew_ms).hold_reserve_ms, 100)
+
+    def test_skipped_extreme_request_spike_keeps_pending_confirmation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _ = monitor_for(Path(directory), Clock())
+            _, state = monitor._observe_hold_feedback(
+                1500, 1000, late_delta_ms=400, perfect_ms=210)
+            self.assertEqual(state, 'late_hit_spike_pending')
+            _, state = monitor._observe_hold_feedback(
+                1500, 1000, late_delta_ms=400, perfect_ms=210, request_excess_ms=550)
+            self.assertEqual(state, 'request_spike_skipped')
+            self.assertTrue(monitor._pending_hold_spike)
+            _, state = monitor._observe_hold_feedback(
+                1500, 1000, late_delta_ms=400, perfect_ms=210, request_excess_ms=0)
+            self.assertEqual(state, 'repeated_late_hit_skew')
+
+    def test_first_extreme_hit_preserves_budget_for_unknown_direction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _ = monitor_for(Path(directory), Clock())
+            # 10-05 demo_alt2_new: a moderate error, a first extreme hit, then a
+            # slow hit whose direction is unknown. It must still be filtered.
+            _, state = monitor._observe_hold_feedback(
+                1005.8, 1131, late_delta_ms=286, perfect_ms=210, request_excess_ms=448)
+            self.assertEqual(state, 'request_spike_skipped')
+            _, state = monitor._observe_hold_feedback(
+                1081.8, 668, late_delta_ms=406.5, perfect_ms=210, request_excess_ms=449)
+            self.assertEqual(state, 'late_hit_spike_pending')
+            self.assertEqual(monitor._request_spike_skips, 1)
+            _, state = monitor._observe_hold_feedback(
+                1848, 1098, late_delta_ms=None, perfect_ms=210, request_excess_ms=850)
+            self.assertEqual(state, 'request_spike_skipped')
+            self.assertEqual(list(monitor._timing.hold_errors), [])
+
+    def test_reentering_same_battle_does_not_clear_concurrent_death(self):
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _ = monitor_for(Path(directory), Clock())
+            monitor._prepare_boss_lifecycle(ENTRY)
+            stopped = monitor._boss_defeated
+            original_is_set = stopped.is_set
+
+            def concurrent_death():
+                # Another combat loop learns of death just after a false read.
+                stopped.set()
+                return False
+
+            with patch.object(stopped, "is_set", side_effect=concurrent_death):
+                monitor._prepare_boss_lifecycle(ENTRY)
+            self.assertTrue(original_is_set(), "Re-entering the same battle lost the shared stop signal")
+
+    def test_retry_after_from_http_headers(self):
+        import httpx
+        cases = [("2", 2), ("invalid", 0), ("NaN", 0), ("inf", 0), ("-1", 0),
+                 (format_datetime(datetime.fromtimestamp(1030, timezone.utc), usegmt=True), 30)]
+        for value, expected in cases:
+            def handler(request):
+                return httpx.Response(429, headers={"Retry-After": value}, json={"ok": False, "error": "server_busy"})
+            with httpx.Client(transport=httpx.MockTransport(handler)) as client, patch.object(support.time, "time", return_value=1000):
+                with self.assertRaises(boss.MiniAppBeastError) as caught:
+                    support._json_post_with_client(client, support.ORIGIN, support.API_PREFIX + "window", {}, 1)
+                self.assertEqual(caught.exception.retry_after, expected)
+
+    def test_bounded_variation_and_reproducibility(self):
+        first, second = CombatTiming(rng=random.Random(4)), CombatTiming(rng=random.Random(4))
+        plans = [first.plan(210, 1180) for _ in range(1000)]
+        self.assertEqual(plans, [second.plan(210, 1180) for _ in range(1000)])
+        self.assertTrue(all(abs(p.offset_ms) <= 116 and 560 <= p.hold_ms <= 1150 for p in plans))
+        self.assertLess(sum(abs(p.offset_ms) <= 40 for p in plans) / len(plans), .75)
+        self.assertGreater(max(p.hold_ms for p in plans) - min(p.hold_ms for p in plans), 80)
+        self.assertTrue(all(.36 <= first.poll_delay() <= .45 for _ in range(100)))
+
+    def test_observed_hold_variability_reduces_upper_target(self):
+        stable, variable = CombatTiming(rng=random.Random(1)), CombatTiming(rng=random.Random(1))
+        for error in (0, 180, 240, 200):
+            variable.observe_hold(1000 + error, 1000)
+        a, b = stable.plan(210, 1180), variable.plan(210, 1180)
+        self.assertGreater(b.hold_reserve_ms, a.hold_reserve_ms)
+        self.assertLess(b.hold_ms, a.hold_ms)
+
+
+if __name__ == "__main__":
+    logging.disable(logging.CRITICAL)
+    unittest.main()

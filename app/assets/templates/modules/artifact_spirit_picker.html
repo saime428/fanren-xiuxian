@@ -1,0 +1,21 @@
+{# 识别到的器灵法宝做成勾选框，手填框只留识别不到的；提交时两者合并（name="targets" + field_name）。 #}
+{% macro spirit_picker(options, current_text, field_name, label, active, placeholder='玄天斩灵剑') %}
+{% set pick = split_artifact_choice(current_text, options | map(attribute='name') | list) %}
+{% if options %}
+<fieldset class="full-span artifact-spirit-picker">
+    <legend>{{ label }}（识别到的器灵法宝，可多选，各记各的冷却）</legend>
+    {% for option in options %}
+    <label><input type="checkbox" name="targets" value="{{ option.name }}" {% if option.name in pick[0] %}checked{% endif %} {% if active %}disabled{% endif %}>{{ option.name }} · {{ option.spirit }}{% if option.level %} Lv{{ option.level }}{% endif %}</label>
+    {% endfor %}
+</fieldset>
+<label class="full-span">
+    其他（识别不到的手填，可空，多件用、隔开）
+    <input name="{{ field_name }}" value="{{ pick[1] }}" {% if active %}readonly{% endif %}>
+</label>
+{% else %}
+<label class="full-span">
+    {{ label }}（多件用、隔开，各记各的冷却）
+    <input name="{{ field_name }}" value="{{ current_text }}" placeholder="{{ placeholder }}" {% if active %}readonly{% endif %} required>
+</label>
+{% endif %}
+{% endmacro %}

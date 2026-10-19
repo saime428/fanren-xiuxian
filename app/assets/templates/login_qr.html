@@ -1,0 +1,58 @@
+{# 扫码登录：没在登录中显示开始按钮；扫码中显示二维码，每 2 秒查一次进度。两步验证复用页面上的密码表单。 #}
+{% if qr_mode and login_challenge.status != 'password_required' %}
+<div class="qr-login-box top-gap" data-qr-login>
+    <p class="muted">用手机 Telegram 打开「设置 → 设备 → 连接桌面设备」，扫下面的二维码。</p>
+    <div class="qr-login-code" data-qr-code></div>
+    <p class="muted" data-qr-status aria-live="polite">正在生成二维码…</p>
+    <form method="post" action="/auth/telegram/qr/start">
+        <button type="submit" class="inline-button">换一个二维码</button>
+    </form>
+</div>
+<script src="{{ url_for('static', path='/qrcode-generator-1.4.4.min.js') }}"></script>
+<script>
+(() => {
+  const box = document.querySelector('[data-qr-login]')
+  if (!box) return
+  const code = box.querySelector('[data-qr-code]')
+  const status = box.querySelector('[data-qr-status]')
+  let shown = ''
+  async function poll() {
+    let data
+    try {
+      data = await (await fetch('/auth/telegram/qr/status', { cache: 'no-store' })).json()
+    } catch (_err) {
+      status.textContent = '连不上服务器，稍后重试…'
+      return setTimeout(poll, 3000)
+    }
+    if (data.status === 'qr_done') {
+      status.textContent = '扫码成功，正在登录…'
+      window.location.href = '/auth/telegram/qr/complete'
+      return
+    }
+    if (data.status === 'password_required') {
+      window.location.reload()
+      return
+    }
+    if (data.status === 'qr_failed' || data.status === 'missing') {
+      code.replaceChildren()
+      status.textContent = (data.error || '扫码已失效') + '，点「换一个二维码」重新开始'
+      return
+    }
+    if (data.url && data.url !== shown) {
+      const qr = qrcode(0, 'M')
+      qr.addData(data.url)
+      qr.make()
+      code.innerHTML = qr.createSvgTag(5, 2)
+      shown = data.url
+      status.textContent = '等待扫码…（二维码过期会自动换新）'
+    }
+    setTimeout(poll, 2000)
+  }
+  poll()
+})()
+</script>
+{% elif not login_challenge %}
+<form class="top-gap" method="post" action="/auth/telegram/qr/start">
+    <button type="submit" class="inline-button">扫码登录（不用手机号和验证码）</button>
+</form>
+{% endif %}

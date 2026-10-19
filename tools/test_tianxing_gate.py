@@ -1,0 +1,194 @@
+"""Exploration gate as a command group: other-route lock, queue what is missing, release when set.
+
+run: PYTHONPATH=app/src python tools/test_tianxing_gate.py
+"""
+
+from __future__ import annotations
+
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "app" / "src"))
+
+from tg_game.features.tianxing import biz_tianxing_runtime as tx  # noqa: E402
+from tg_game.storage import Storage  # noqa: E402
+
+CHAT = -1001000000001
+DAY = tx.get_day_key()
+
+
+def queued(storage, profile_id):
+    with storage.connect() as conn:
+        return [r[0] for r in conn.execute("select text from outgoing_commands where profile_id=? order by id", (profile_id,))]
+
+
+def gate(storage, profile_id, now):
+    return tx.build_exploration_route_gate(storage, profile_id=profile_id, chat_id=CHAT, thread_id=1, chat_type="group", bot_username="fanrenxiuxian_bot", now=now)
+
+
+def main() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "t.db")
+        storage.init_schema()
+        profile = storage.create_profile("t")
+        storage.update_profile_sect_info(profile.id, sect_name="天星宗")
+        now = time.time()
+        tx.set_profile_config(storage, profile.id, {"auto_predict_enabled": True, "auto_change_fate_enabled": True})
+        base = {"observed_stars": ["贪狼"], "observed_stars_day": DAY, "available_stars": ["贪狼"], "available_stars_source": "observe", "available_stars_day": DAY, "fixed_star": "贪狼", "fixed_star_day": DAY}
+
+        # 1. a pending 斗法 推命 blocks exploration and queues nothing
+        tx.save_profile_record(storage, profile.id, state={**base, "current_prediction": "斗法", "current_prediction_until": now + 3600})
+        result = gate(storage, profile.id, now)
+        assert result["allowed"] is False and "斗法" in result["reason"], result
+        assert queued(storage, profile.id) == [], queued(storage, profile.id)
+
+        # 2. nothing pending: both 推命 探索 and 改命 探索 go out as one group, gate stays closed
+        tx.save_profile_record(storage, profile.id, state=base)
+        result = gate(storage, profile.id, now)
+        assert result["allowed"] is False, result
+        assert queued(storage, profile.id) == [".推命 探索", ".改命 探索"], queued(storage, profile.id)
+
+        # 3. both confirmed and the 天机盘 was checked recently: released without extra commands
+        armed = {**base, "current_prediction": "探索", "current_prediction_until": now + 3600, "current_change": "探索", "current_change_until": now + 3600}
+        tx.save_profile_record(storage, profile.id, state={**armed, "last_panel_checked_at": now - 60})
+        result = gate(storage, profile.id, now)
+        assert result["allowed"] is True, result
+        assert len(queued(storage, profile.id)) == 2
+
+        # 3b. 09-26: 本地记着改命还在，其实 09-25 12:47 裂缝败局「改命回天」已经用掉了（回包没认领上），
+        # 零点 8 场深入全裸打。本地说在、但半小时内没对过天机盘 → 先查盘，不放行
+        tx.save_profile_record(storage, profile.id, state={**armed, "last_panel_checked_at": now - 11 * 3600})
+        with storage.connect() as conn:  # 那道改命是 11 小时前挂的：第 2 步的推命/改命按那时发出算
+            conn.execute("update outgoing_commands set created_at=created_at-11*3600")
+        result = gate(storage, profile.id, now)
+        assert result["allowed"] is False and queued(storage, profile.id)[-1] == ".天机盘", (result, queued(storage, profile.id))
+        # 盘上写「当前改命: 无」→ 本地清掉，下一轮补挂改命
+        panel = "【天机盘】\n今日可选命星: 【贪狼】\n今日已定命星: 【贪狼】\n当前推命: 探索（剩余 7小时50分钟）\n当前改命: 无\n天机值: 121\n逆命劫: 0"
+        record = tx.get_profile_record(storage, profile.id)
+        after = tx.apply_parsed_to_state(record["state"], tx.parse_tianxing_text(panel, now=now), now=now)
+        assert after["current_change"] == "" and after["last_panel_checked_at"] == now, after
+        tx.save_profile_record(storage, profile.id, state=after)
+        with storage.connect() as conn:  # 盘的回包到了 = 这条指令已确认
+            conn.execute("update outgoing_commands set status='confirmed'")
+        result = gate(storage, profile.id, now + 5)
+        assert result["allowed"] is False and queued(storage, profile.id)[-1] == ".改命 探索", (result, queued(storage, profile.id))
+
+        # 3c. 10-13：gate 放行了裂缝，回包【改命回天】【推命命中】没认领上，本地推命/改命原样；19 分钟后的野外历练
+        # 离上次对盘才 21 分钟，半小时规则兜不住。放行之后既没见到结算也没对过盘，就先查盘（修前：8 场深入裸打）
+        with storage.connect() as conn:
+            conn.execute("update outgoing_commands set status='confirmed'")
+        tx.save_profile_record(storage, profile.id, state={**armed, "last_panel_checked_at": now - 180})
+        assert gate(storage, profile.id, now)["allowed"] is True
+        before = queued(storage, profile.id)
+        result = gate(storage, profile.id, now + 1116)
+        assert result["allowed"] is False and queued(storage, profile.id)[len(before):] == [".天机盘"], (result, queued(storage, profile.id))
+        # 见到结算就不用查：正常日一场接一场，只补推命，不多发 .天机盘
+        with storage.connect() as conn:
+            conn.execute("update outgoing_commands set status='confirmed'")
+        tx.save_profile_record(storage, profile.id, state={**armed, "last_panel_checked_at": now - 180})
+        assert gate(storage, profile.id, now)["allowed"] is True
+        tx.apply_settlement_text(storage, profile.id, "【野外历练】\n【推命命中】司命演算吻合，天机值 +1，宗门贡献 +30\n【改命待发】此道改命尚可维持 23小时58分钟", now=now + 8)
+        before = queued(storage, profile.id)
+        result = gate(storage, profile.id, now + 9)
+        assert result["allowed"] is False and queued(storage, profile.id)[len(before):] == [".推命 探索"], (result, queued(storage, profile.id))
+
+        # 3d. 10-17：野外历练改成每 10 秒复查 gate。回包到了、状态却没就位（失败或没认出来）：ack 窗口内不重发，
+        # 过了窗口才重发；正常连打（两场之间放行过一次）照样马上补推命。这一段用真实时间，和指令的发送时间同一个钟
+        settle = "【野外历练】\n【推命命中】司命演算吻合，天机值 +1，宗门贡献 +30\n【改命待发】此道改命尚可维持 23小时58分钟"
+        with storage.connect() as conn:  # 前面几步是压缩时间演的，那些指令都算早已过去
+            conn.execute("update outgoing_commands set status='confirmed', created_at=created_at-3600")
+        t0 = time.time()
+        tx.save_profile_record(storage, profile.id, state={**base, "exploration_released_at": t0 - 600, "last_panel_checked_at": t0 - 300})
+        before = queued(storage, profile.id)
+        gate(storage, profile.id, t0)
+        assert queued(storage, profile.id)[len(before):] == [".推命 探索", ".改命 探索"], queued(storage, profile.id)
+        with storage.connect() as conn:  # 回包到了，状态没变
+            conn.execute("update outgoing_commands set status='confirmed'")
+        for later in (t0 + 10, t0 + 60):
+            assert gate(storage, profile.id, later)["allowed"] is False
+            assert len(queued(storage, profile.id)) == len(before) + 2, (later - t0, queued(storage, profile.id))
+        gate(storage, profile.id, t0 + 95)
+        assert queued(storage, profile.id)[len(before) + 2:] == [".推命 探索", ".改命 探索"], queued(storage, profile.id)
+        with storage.connect() as conn:
+            conn.execute("update outgoing_commands set status='confirmed'")
+        t1 = time.time() + 1
+        tx.save_profile_record(storage, profile.id, state={
+            **base, "current_prediction": "探索", "current_prediction_until": t1 + 3600, "current_change": "探索",
+            "current_change_until": t1 + tx.TIANXING_CHANGE_FATE_SECONDS, "last_panel_checked_at": t1,
+        })
+        assert gate(storage, profile.id, t1)["allowed"] is True
+        tx.apply_settlement_text(storage, profile.id, settle, now=t1 + 5)
+        before = queued(storage, profile.id)
+        assert gate(storage, profile.id, t1 + 6)["allowed"] is False
+        assert queued(storage, profile.id)[len(before):] == [".推命 探索"], queued(storage, profile.id)
+
+        # 4. a duel settlement consumes the pending 斗法 推命 (not only 炼制 any more)
+        state = tx.normalize_state({"current_prediction": "斗法", "current_prediction_until": now + 3600})
+        parsed = tx.parse_tianxing_text("【天道战报·文字版】\n胜者：@me\n【推命命中】司命演算吻合，天机值 +1，宗门贡献 +30", now=now)
+        after = tx.apply_parsed_to_state(state, parsed, now=now)
+        assert after["current_prediction"] == "", after["current_prediction"]
+
+        # 5. MiniApp 野外历练 notes reach the state the same way
+        tx.save_profile_record(storage, profile.id, state={**base, "current_prediction": "探索", "current_prediction_until": now + 3600})
+        tx.apply_settlement_text(storage, profile.id, "【野外历练】\n【推命命中】司命演算吻合，天机值 +1，宗门贡献 +30", now=now)
+        assert tx.normalize_state(tx.get_profile_record(storage, profile.id)["state"])["current_prediction"] == ""
+
+        # 6. the daily star falls back to 紫微 when neither 贪狼 nor 太阴 showed up
+        assert tx._select_set_star(tx.normalize_config({}), ["天府", "紫微"]) == "紫微"
+
+        # 7. occupied 改命 斗法: wait until it expires, do not keep sending 推命/改命 探索
+        before = queued(storage, profile.id)
+        change_until = now + 22 * 3600 + 17 * 60
+        tx.save_profile_record(
+            storage,
+            profile.id,
+            state={
+                **base,
+                "current_prediction": "探索",
+                "current_prediction_until": now + 8 * 3600,
+                "current_change": "斗法",
+                "current_change_until": change_until,
+                "current_change_until_source": "cooldown_reply",
+            },
+        )
+        result = gate(storage, profile.id, now)
+        assert result["allowed"] is False, result
+        assert "斗法" in result["reason"], result
+        assert abs(float(result["next_time"]) - change_until) < 1, result
+        assert queued(storage, profile.id) == before, queued(storage, profile.id)
+
+        # 8. the game cooldown reply is what stamps 改命 斗法 + remaining time
+        parsed = tx.parse_tianxing_text(
+            "你已有一道关于【斗法】的改命尚未耗尽，还可维持 22小时17分钟。",
+            now=now,
+        )
+        assert parsed.get("action") == "改命", parsed
+        assert parsed.get("result") == "cooldown", parsed
+        assert parsed.get("current_change") == "斗法", parsed
+        assert abs(float(parsed.get("current_change_until") or 0) - change_until) < 1, parsed
+
+        # 9. 10-16 06:09 实况：别路推命快到期时回「还需等待 0分钟」——是不到一分钟，不是没写时长；
+        #    原来按默认 8 小时记，野外历练白等到 14:09
+        parsed = tx.parse_tianxing_text("你已有一道关于 【斗法】 的推命尚未应验，还需等待 0分钟。", now=now)
+        assert parsed.get("result") == "cooldown" and parsed.get("current_prediction") == "斗法", parsed
+        assert float(parsed.get("current_prediction_until") or 0) - now <= 60, parsed
+        parsed = tx.parse_tianxing_text("你已有一道关于 【斗法】 的推命尚未应验，还需等待 37分钟。", now=now)
+        assert abs(float(parsed.get("current_prediction_until") or 0) - (now + 37 * 60)) < 1, parsed
+
+        # 10. 群里别人指令的回包不进审计表（10-16 一天七千多条、占了库的一半）；认不上的天星回包照记，留作诊断
+        def audit_count():
+            with storage.connect() as conn:
+                return conn.execute("select count(*) from tianxing_audit_events where event_type='reply_unattributed'").fetchone()[0]
+        before = audit_count()
+        tx.handle_bot_reply(storage, profile_id=profile.id, chat_id=CHAT, text="道友 @someone 闭关成功，修为+12", reply_to_msg_id=424242, message_id=1)
+        assert audit_count() == before, "别人的回包不该记"
+        tx.handle_bot_reply(storage, profile_id=profile.id, chat_id=CHAT, text="【改命回天】你提前布下的后手被触发", reply_to_msg_id=424243, message_id=2)
+        assert audit_count() == before + 1, "认不上的天星回包要记"
+    print("test_tianxing_gate: ok")
+
+
+if __name__ == "__main__":
+    main()
